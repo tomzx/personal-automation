@@ -21,7 +21,7 @@ def main():
     else:
         file = Path(args.file).open("r")
 
-    regex = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d{0,6}"
+    regex = r"\d{4}-\d{2}-\d{2}(T\d{2}(:\d{2}(:\d{2}(\.\d{3,6})?)?)?)?"
 
     deltas = []
     last_timestamp = None
