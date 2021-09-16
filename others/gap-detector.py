@@ -30,7 +30,7 @@ def main():
     end_timestamp = 0
     timestamp = 0
     for line in file.readlines():
-        match = re.match(regex, line)
+        match = re.search(regex, line)
         if not match:
             continue
 
