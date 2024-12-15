@@ -5,8 +5,14 @@ use Symfony\Component\DomCrawler\Crawler;
 require_once __DIR__ . '/../vendor/autoload.php';
 
 function processFile(string $file) {
+    echo 'Processing file: ' . $file . PHP_EOL;
     $content = file_get_contents($file);
     $content = str_replace('<br>', PHP_EOL, $content);
+
+    if (strpos($content, '<div class="chips">') !== false) {
+        return '';
+    }
+
     $dom = new Crawler($content);
 
     $date = date('Y-m-d H:i:s', strtotime($dom->filter('.heading')->text()));
@@ -29,6 +35,11 @@ function processDirectory(string $directory, string $outputDirectory) {
     $files = glob($directory . '/*.html');
     foreach ($files as $file) {
         $content = processFile($file);
+
+        if ($content === '') {
+            continue;
+        }
+
         $filename = basename($file, '.html');
         file_put_contents($outputDirectory . '/' . $filename . '.txt', $content);
     }
