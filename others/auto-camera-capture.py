@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Camera Capture CLI - Capture images from camera using ffmpeg at specified intervals
 """
