@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 
 # Script to get GitHub activity for a user over a period of time
-# Usage: ./summarize-github-activity [username] [start_date] [end_date]
-# Example: ./summarize-github-activity tomzx 2025-10-20 2025-10-25 (date range)
-# Example: ./summarize-github-activity tomzx 2025-10-20 (from Oct 20 to today)
-# Example: ./summarize-github-activity (defaults to tomzx, today only)
+# Usage: ./summarize-github-activity [username] [start_date] [end_date] [orgs]
+# Example: ./summarize-github-activity tomzx 2025-10-20 2025-10-25 "org1,org2" (date range, specific orgs)
+# Example: ./summarize-github-activity tomzx 2025-10-20 "" "org1,org2" (from Oct 20 to today, specific orgs)
+# Example: ./summarize-github-activity tomzx 2025-10-20 2025-10-25 (date range, all orgs)
+# Example: ./summarize-github-activity tomzx 2025-10-20 (from Oct 20 to today, all orgs)
+# Example: ./summarize-github-activity (defaults to tomzx, today only, all orgs)
+#
+# Organizations can also be set via GITHUB_ORGS environment variable (comma-separated)
+# Example: GITHUB_ORGS="org1,org2" ./summarize-github-activity tomzx 2025-10-20
 
 # Default values
 USER="${1:-tomzx}"
@@ -20,26 +25,28 @@ else
     END_DATE="$START_DATE"
 fi
 
-echo "Fetching GitHub activity for user: $USER"
+# Organizations parameter or environment variable
+ORGS="${4:-${GITHUB_ORGS}}"
+if [ -n "$ORGS" ]; then
+    # Convert comma-separated list to space-separated org: qualifiers
+    ORG_FILTER=$(echo "$ORGS" | tr ',' '\n' | sed 's/^/org:/' | tr '\n' ' ')
+    ORG_DISPLAY=" (Organizations: $ORGS)"
+else
+    ORG_FILTER=""
+    ORG_DISPLAY=" (All organizations)"
+fi
+
+echo "Fetching GitHub activity for user: $USER$ORG_DISPLAY"
 echo "Date range: $START_DATE to $END_DATE"
 echo "================================================"
 echo ""
-
-# Calculate next day after end date for inclusive range
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS
-    NEXT_DATE=$(date -j -v+1d -f "%Y-%m-%d" "$END_DATE" +%Y-%m-%d)
-else
-    # Linux/Windows (Git Bash)
-    NEXT_DATE=$(date -d "$END_DATE + 1 day" +%Y-%m-%d)
-fi
 
 # Run all searches in parallel
 echo "Fetching data..."
 echo ""
 
 # Search for commits (background)
-gh search commits --author="$USER" --author-date="$START_DATE..$NEXT_DATE" --limit 100 --json repository,commit,author,committer --jq '
+gh search commits --author="$USER" $ORG_FILTER --author-date="$START_DATE..$END_DATE" --limit 100 --json repository,commit,author,committer --jq '
   group_by(.repository.owner.login + "/" + .repository.name) |
   .[] |
   "  [\(.[0].repository.owner.login)/\(.[0].repository.name)]" + "\n" +
@@ -48,25 +55,30 @@ gh search commits --author="$USER" --author-date="$START_DATE..$NEXT_DATE" --lim
 PID_COMMITS=$!
 
 # Search for pull requests created (background)
-gh search prs --author="$USER" --created="$START_DATE..$NEXT_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_prs_$$.txt 2>/dev/null &
+gh search prs --author="$USER" $ORG_FILTER --created="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_prs_$$.txt 2>/dev/null &
 PID_PRS=$!
 
 # Search for pull requests reviewed (background)
-gh search prs --reviewed-by="$USER" --updated="$START_DATE..$NEXT_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_pr_reviews_$$.txt 2>/dev/null &
+gh search prs --reviewed-by="$USER" $ORG_FILTER --updated="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_pr_reviews_$$.txt 2>/dev/null &
 PID_PR_REVIEWS=$!
 
+# Search for pull requests merged (background)
+gh search prs --author="$USER" $ORG_FILTER --merged-at="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,closedAt --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (merged: \(.closedAt | sub("T"; " ") | sub("Z"; ""))) - \(.url)"' > /tmp/gh_prs_merged_$$.txt 2>/dev/null &
+PID_PRS_MERGED=$!
+
 # Search for issues created (background)
-gh search issues --author="$USER" --created="$START_DATE..$NEXT_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_issues_$$.txt 2>/dev/null &
+gh search issues --author="$USER" $ORG_FILTER --created="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_issues_$$.txt 2>/dev/null &
 PID_ISSUES=$!
 
 # Search for issues commented on (background)
-gh search issues --commenter="$USER" --updated="$START_DATE..$NEXT_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_comments_$$.txt 2>/dev/null &
+gh search issues --commenter="$USER" $ORG_FILTER --updated="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_comments_$$.txt 2>/dev/null &
 PID_COMMENTS=$!
 
 # Wait for all background jobs to complete
 wait $PID_COMMITS
 wait $PID_PRS
 wait $PID_PR_REVIEWS
+wait $PID_PRS_MERGED
 wait $PID_ISSUES
 wait $PID_COMMENTS
 
@@ -98,6 +110,15 @@ else
 fi
 echo ""
 
+echo "✅ Pull Requests Merged:"
+PRS_MERGED=$(cat /tmp/gh_prs_merged_$$.txt)
+if [ -z "$PRS_MERGED" ]; then
+  echo "  None"
+else
+  echo "$PRS_MERGED"
+fi
+echo ""
+
 echo "🐛 Issues Created:"
 ISSUES=$(cat /tmp/gh_issues_$$.txt)
 if [ -z "$ISSUES" ]; then
@@ -117,6 +138,6 @@ fi
 echo ""
 
 # Clean up temporary files
-rm -f /tmp/gh_commits_$$.txt /tmp/gh_prs_$$.txt /tmp/gh_pr_reviews_$$.txt /tmp/gh_issues_$$.txt /tmp/gh_comments_$$.txt
+rm -f /tmp/gh_commits_$$.txt /tmp/gh_prs_$$.txt /tmp/gh_pr_reviews_$$.txt /tmp/gh_prs_merged_$$.txt /tmp/gh_issues_$$.txt /tmp/gh_comments_$$.txt
 echo "================================================"
 echo "Activity summary complete!"
