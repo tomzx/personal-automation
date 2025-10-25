@@ -1,0 +1,4 @@
+- name: Auto Screenshot
+  command: uv run F:\Tom\Documents\GIT\personal-automation\others\auto-screenshot.py "H:\SCREEN-REC\{date}\{screen}\{date}-{time}.{format}" --format jpeg --interval 60
+- name: Auto Camera Capture
+  command: uv run F:\Tom\Documents\GIT\personal-automation\others\auto-camera-capture.py "H:\WEBCAM-SNAPSHOT\{date}\{date}-{time}.{format}" --format jpeg --device "HD Pro Webcam C920"
