@@ -70,10 +70,14 @@ def check_gh_installed() -> bool:
         return False
 
 
-def find_active_issues(base_path: Path) -> list[tuple[str, str]]:
+def find_active_issues(base_path: Path, active_only: bool = True) -> list[tuple[str, str]]:
     """
-    Find all active issues by scanning for .active files.
+    Find all active issues by scanning directories.
     Directory structure is assumed to be {base_path}/{owner/repo}/{issue_number}.
+
+    Args:
+        base_path: Base path containing repository directories
+        active_only: If True, only return issues with .active files. If False, return all issues.
 
     Returns:
         List of tuples: (repository in owner/repo format, issue_number)
@@ -106,9 +110,13 @@ def find_active_issues(base_path: Path) -> list[tuple[str, str]]:
 
                 issue_number = issue_dir.name
 
-                # Check if this issue is active
-                active_file = issue_dir / ".active"
-                if active_file.exists():
+                # Check if this issue should be included
+                if active_only:
+                    active_file = issue_dir / ".active"
+                    if active_file.exists():
+                        active_issues.append((repository, issue_number))
+                else:
+                    # Include all issue directories
                     active_issues.append((repository, issue_number))
 
     return active_issues
@@ -512,17 +520,72 @@ def get_issue_comments(repository: str, issue_number: str, updated_since: Option
         return []
 
 
-def is_pull_request(repository: str, number: str) -> bool:
+def get_type_from_file(base_path: Path, repository: str, number: str) -> Optional[str]:
+    """
+    Get the type (issue or pr) from the .type file.
+
+    Args:
+        base_path: Base path for issue directories
+        repository: Repository in "owner/repo" format
+        number: Issue/PR number
+
+    Returns:
+        "issue" or "pr" if type file exists, None otherwise
+    """
+    issue_dir = base_path / repository / number
+    type_file = issue_dir / ".type"
+
+    if type_file.exists():
+        try:
+            content = type_file.read_text().strip().lower()
+            if content in ("issue", "pr"):
+                return content
+        except Exception as e:
+            print(f"Error reading type file {type_file}: {e}", file=sys.stderr)
+
+    return None
+
+
+def save_type_to_file(base_path: Path, repository: str, number: str, type_value: str) -> None:
+    """
+    Save the type (issue or pr) to the .type file.
+
+    Args:
+        base_path: Base path for issue directories
+        repository: Repository in "owner/repo" format
+        number: Issue/PR number
+        type_value: Either "issue" or "pr"
+    """
+    issue_dir = base_path / repository / number
+    type_file = issue_dir / ".type"
+
+    try:
+        # Ensure the directory exists
+        issue_dir.mkdir(parents=True, exist_ok=True)
+        type_file.write_text(type_value.lower())
+    except Exception as e:
+        print(f"Error writing type file {type_file}: {e}", file=sys.stderr)
+
+
+def is_pull_request(repository: str, number: str, base_path: Optional[Path] = None) -> bool:
     """
     Check if a given number is a pull request.
 
     Args:
         repository: Repository in "owner/repo" format
         number: Issue/PR number
+        base_path: Optional base path to check for cached .type file
 
     Returns:
         True if it's a PR, False otherwise
     """
+    # First check if we have a cached type
+    if base_path:
+        cached_type = get_type_from_file(base_path, repository, number)
+        if cached_type is not None:
+            return cached_type == "pr"
+
+    # If not cached, check via API
     try:
         # Try to get PR info - if it succeeds, it's a PR
         result = subprocess.run(
@@ -530,7 +593,13 @@ def is_pull_request(repository: str, number: str) -> bool:
             capture_output=True,
             text=True
         )
-        return result.returncode == 0
+        is_pr = result.returncode == 0
+
+        # Cache the result if base_path is provided
+        if base_path:
+            save_type_to_file(base_path, repository, number, "pr" if is_pr else "issue")
+
+        return is_pr
     except Exception as e:
         print(f"Error checking if {repository}#{number} is a PR: {e}", file=sys.stderr)
         return False
@@ -801,9 +870,11 @@ async def monitor_repositories(
                 if dry_run:
                     print(f"    [DRY RUN] Would publish github.issue.new event")
                     print(f"    [DRY RUN] Would save .last_checked timestamp")
+                    print(f"    [DRY RUN] Would save .type file as 'issue'")
                 else:
                     await publish_event(js, "github.issue.new", event_data)
                     save_last_checked(base_path, repository, issue_number, current_time)
+                    save_type_to_file(base_path, repository, issue_number, "issue")
                     new_issues_count += 1
 
         print()
@@ -819,7 +890,7 @@ async def process_active_issues(
 ) -> None:
     """Process all active issues and publish appropriate events."""
     current_time = datetime.now(timezone.utc).isoformat()
-    
+
     # Group issues by repository
     issues_by_repo: dict[str, list[str]] = {}
     for repository, issue_number in active_issues:
@@ -897,7 +968,7 @@ async def monitor_issue_comments(
 
     for repository, issue_number in active_issues:
         # First check if this is actually an issue (not a PR)
-        if is_pull_request(repository, issue_number):
+        if is_pull_request(repository, issue_number, base_path):
             print(f"Skipping {repository}#{issue_number} - is a pull request, not an issue")
             continue
 
@@ -960,7 +1031,7 @@ async def monitor_pr_comments(
 
     for repository, pr_number in active_prs:
         # First check if this is actually a PR
-        if not is_pull_request(repository, pr_number):
+        if not is_pull_request(repository, pr_number, base_path):
             print(f"Skipping {repository}#{pr_number} - not a pull request")
             continue
 
@@ -1039,8 +1110,11 @@ async def main_async(args):
         # Find all active issues (if issue monitoring is enabled)
         active_issues = []
         if args.monitor_issues:
-            print(f"Scanning {args.path} for active issues...")
-            active_issues = find_active_issues(args.path)
+            if args.active_only:
+                print(f"Scanning {args.path} for active issues (with .active flag)...")
+            else:
+                print(f"Scanning {args.path} for all issues...")
+            active_issues = find_active_issues(args.path, args.active_only)
 
             if not active_issues:
                 print("No active issues found.")
@@ -1053,8 +1127,11 @@ async def main_async(args):
         elif args.monitor_issue_comments or args.monitor_pr_comments:
             # If comment monitoring is enabled but issue monitoring is not,
             # still need to find active issues for comment checking
-            print(f"Scanning {args.path} for active issues (for comment monitoring)...")
-            active_issues = find_active_issues(args.path)
+            if args.active_only:
+                print(f"Scanning {args.path} for active issues (with .active flag, for comment monitoring)...")
+            else:
+                print(f"Scanning {args.path} for all issues (for comment monitoring)...")
+            active_issues = find_active_issues(args.path, args.active_only)
             if not active_issues:
                 print("No active issues found.")
             else:
@@ -1132,6 +1209,12 @@ def main():
         default=True,
         action=argparse.BooleanOptionalAction,
         help="Monitor and publish events for new comments on active pull requests"
+    )
+    parser.add_argument(
+        "--active-only",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Only monitor issues with .active flag (default: True). Use --no-active-only to monitor all issue directories."
     )
 
     args = parser.parse_args()
