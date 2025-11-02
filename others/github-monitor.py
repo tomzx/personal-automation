@@ -434,6 +434,31 @@ def save_last_comment_check(base_path: Path, repository: str, issue_number: str,
         print(f"Error writing timestamp file {timestamp_file}: {e}", file=sys.stderr)
 
 
+def get_last_checked(base_path: Path, repository: str, issue_number: str) -> Optional[str]:
+    """
+    Get the timestamp of the last time an issue was monitored.
+
+    Args:
+        base_path: Base path for issue directories
+        repository: Repository in "owner/repo" format
+        issue_number: Issue or PR number
+
+    Returns:
+        ISO8601 timestamp string, or None if never checked
+    """
+    issue_dir = base_path / repository / issue_number
+    timestamp_file = issue_dir / ".last_checked"
+
+    if timestamp_file.exists():
+        try:
+            return timestamp_file.read_text().strip()
+        except Exception as e:
+            print(f"Error reading timestamp file {timestamp_file}: {e}", file=sys.stderr)
+            return None
+
+    return None
+
+
 def save_last_checked(base_path: Path, repository: str, issue_number: str, timestamp: str) -> None:
     """
     Save the timestamp of the last time an issue was monitored.
@@ -861,6 +886,13 @@ async def process_active_issues(
                 item_data = open_items[number]
                 item_type = item_data.get("type", "issue")
 
+                # Get the last check timestamp
+                last_check = get_last_checked(base_path, repository, number)
+
+                # Check if the item has been updated since the last check
+                updated_at = item_data.get("updated_at")
+                has_update = last_check is None or (updated_at and updated_at > last_check)
+
                 event_data = {
                     "repository": repository,
                     "number": number,
@@ -868,17 +900,27 @@ async def process_active_issues(
                 }
 
                 if item_type == "pr":
-                    print(f"    PR is still open")
-                    event_subject = "github.pr.updated"
+                    if has_update:
+                        print(f"    PR has been updated, emitting update event")
+                        event_subject = "github.pr.updated"
+                    else:
+                        print(f"    PR is still open (no updates since last check)")
+                        event_subject = None
                 else:
-                    print(f"    Issue is still open")
-                    event_subject = "github.issue.updated"
+                    if has_update:
+                        print(f"    Issue has been updated, emitting update event")
+                        event_subject = "github.issue.updated"
+                    else:
+                        print(f"    Issue is still open (no updates since last check)")
+                        event_subject = None
 
                 if dry_run:
-                    print(f"    [DRY RUN] Would publish {event_subject} event")
+                    if event_subject:
+                        print(f"    [DRY RUN] Would publish {event_subject} event")
                     print(f"    [DRY RUN] Would save .last_checked timestamp")
                 else:
-                    await publish_event(js, event_subject, event_data)
+                    if event_subject:
+                        await publish_event(js, event_subject, event_data)
                     save_last_checked(base_path, repository, number, current_time)
             else:
                 # For closed items, we don't have the data from GraphQL since it only returns open items
