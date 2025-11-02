@@ -1,15 +1,15 @@
 """
-Monitor GitHub issues and publish events to NATS.
+Monitor GitHub issues and pull requests and publish events to NATS.
 
 This script:
-1. Fetches all open issues from tracked repositories using gh CLI
-2. Scans for .active files to determine which issues are actively tracked
-3. For each tracked issue, checks if it's still open on GitHub
+1. Fetches all open issues and PRs from tracked repositories using gh CLI
+2. Scans for .active files to determine which issues/PRs are actively tracked
+3. For each tracked issue/PR, checks if it's still open on GitHub
 4. Monitors comments on issues and pull requests
 5. Publishes events to NATS for:
-   - New open issues discovered
-   - Active issues that are still open (for processing)
-   - Active issues that have been closed (to mark inactive)
+   - New open issues/PRs discovered
+   - Active issues/PRs that are still open (for processing)
+   - Active issues/PRs that have been closed (to mark inactive)
    - New comments on issues
    - New comments on pull requests
 
@@ -17,6 +17,9 @@ Events published:
 - github.issue.new: When a new open issue is discovered
 - github.issue.updated: When an active issue needs processing
 - github.issue.closed: When an active issue has been closed
+- github.pr.new: When a new open PR is discovered
+- github.pr.updated: When an active PR needs processing
+- github.pr.closed: When an active PR has been closed
 - github.issue.comment.new: When a new comment is added to an issue
 - github.pr.comment.new: When a new comment is added to a pull request
 """
@@ -72,15 +75,15 @@ def check_gh_installed() -> bool:
 
 def find_active_issues(base_path: Path, active_only: bool = True) -> list[tuple[str, str]]:
     """
-    Find all active issues by scanning directories.
-    Directory structure is assumed to be {base_path}/{owner/repo}/{issue_number}.
+    Find all active issues and PRs by scanning directories.
+    Directory structure is assumed to be {base_path}/{owner/repo}/{issue_or_pr_number}.
 
     Args:
         base_path: Base path containing repository directories
-        active_only: If True, only return issues with .active files. If False, return all issues.
+        active_only: If True, only return issues/PRs with .active files. If False, return all.
 
     Returns:
-        List of tuples: (repository in owner/repo format, issue_number)
+        List of tuples: (repository in owner/repo format, issue_or_pr_number)
     """
     active_issues = []
 
@@ -122,141 +125,237 @@ def find_active_issues(base_path: Path, active_only: bool = True) -> list[tuple[
     return active_issues
 
 
-def get_open_issues(repository: str, updated_since: Optional[str] = None) -> dict[str, dict]:
-    """
-    Get the list of open issues from GitHub using GraphQL API.
-
-    Args:
-        repository: Repository in "owner/repo" format
-        updated_since: Optional ISO8601 timestamp to filter issues updated since this time
-
-    Returns:
-        Dictionary mapping issue numbers (as strings) to issue data dictionaries
-    """
-    try:
-        owner, repo = repository.split("/")
-
-        # Build the GraphQL query with optional filterBy parameter
-        filter_clause = ""
-        if updated_since:
-            filter_clause = f', filterBy: {{since: "{updated_since}"}}'
-
-        query = f"""
-        {{
-          repository(owner: "{owner}", name: "{repo}") {{
-            issues(first: 100, states: OPEN{filter_clause}) {{
-              pageInfo {{
-                hasNextPage
-                endCursor
-              }}
+def _build_issue_query(owner: str, repo: str, filter_clause: str, cursor: Optional[str] = None) -> str:
+    """Build GraphQL query for fetching issues."""
+    after_clause = f', after: "{cursor}"' if cursor else ""
+    return f"""
+    {{
+      repository(owner: "{owner}", name: "{repo}") {{
+        issues(first: 100, states: OPEN{after_clause}{filter_clause}) {{
+          pageInfo {{
+            hasNextPage
+            endCursor
+          }}
+          nodes {{
+            number
+            title
+            body
+            url
+            state
+            createdAt
+            updatedAt
+            closedAt
+            author {{
+              login
+            }}
+            assignees(first: 10) {{
               nodes {{
-                number
-                title
-                body
-                url
-                state
-                createdAt
-                updatedAt
-                closedAt
-                author {{
-                  login
-                }}
-                assignees(first: 10) {{
-                  nodes {{
-                    login
-                  }}
-                }}
-                labels(first: 10) {{
-                  nodes {{
-                    name
-                  }}
-                }}
+                login
+              }}
+            }}
+            labels(first: 10) {{
+              nodes {{
+                name
               }}
             }}
           }}
         }}
-        """
+      }}
+    }}
+    """
 
-        issues = {}
-        has_next_page = True
-        end_cursor = None
 
-        while has_next_page:
-            # Update query with pagination cursor if needed
-            if end_cursor:
-                paginated_query = f"""
-                {{
-                  repository(owner: "{owner}", name: "{repo}") {{
-                    issues(first: 100, states: OPEN, after: "{end_cursor}"{filter_clause}) {{
-                      pageInfo {{
-                        hasNextPage
-                        endCursor
-                      }}
-                      nodes {{
-                        number
-                        title
-                        body
-                        url
-                        state
-                        createdAt
-                        updatedAt
-                        closedAt
-                        author {{
-                          login
-                        }}
-                        assignees(first: 10) {{
-                          nodes {{
-                            login
-                          }}
-                        }}
-                        labels(first: 10) {{
-                          nodes {{
-                            name
-                          }}
-                        }}
-                      }}
-                    }}
-                  }}
-                }}
-                """
-            else:
-                paginated_query = query
+def _build_pr_query(owner: str, repo: str, filter_clause: str, cursor: Optional[str] = None) -> str:
+    """Build GraphQL query for fetching pull requests."""
+    after_clause = f', after: "{cursor}"' if cursor else ""
+    return f"""
+    {{
+      repository(owner: "{owner}", name: "{repo}") {{
+        pullRequests(first: 100, states: OPEN{after_clause}{filter_clause}) {{
+          pageInfo {{
+            hasNextPage
+            endCursor
+          }}
+          nodes {{
+            number
+            title
+            body
+            url
+            state
+            createdAt
+            updatedAt
+            closedAt
+            mergedAt
+            author {{
+              login
+            }}
+            assignees(first: 10) {{
+              nodes {{
+                login
+              }}
+            }}
+            labels(first: 10) {{
+              nodes {{
+                name
+              }}
+            }}
+            isDraft
+            mergeable
+            reviewDecision
+          }}
+        }}
+      }}
+    }}
+    """
 
+
+def _parse_issue_node(issue: dict) -> dict:
+    """Parse a GraphQL issue node into standardized format."""
+    return {
+        "type": "issue",
+        "number": issue["number"],
+        "title": issue["title"],
+        "body": issue["body"],
+        "url": issue["url"],
+        "state": issue["state"],
+        "created_at": issue["createdAt"],
+        "updated_at": issue["updatedAt"],
+        "closed_at": issue["closedAt"],
+        "author": issue["author"]["login"] if issue["author"] else "ghost",
+        "assignees": [a["login"] for a in issue["assignees"]["nodes"]],
+        "labels": [l["name"] for l in issue["labels"]["nodes"]]
+    }
+
+
+def _parse_pr_node(pr: dict) -> dict:
+    """Parse a GraphQL pull request node into standardized format."""
+    return {
+        "type": "pr",
+        "number": pr["number"],
+        "title": pr["title"],
+        "body": pr["body"],
+        "url": pr["url"],
+        "state": pr["state"],
+        "created_at": pr["createdAt"],
+        "updated_at": pr["updatedAt"],
+        "closed_at": pr["closedAt"],
+        "merged_at": pr["mergedAt"],
+        "author": pr["author"]["login"] if pr["author"] else "ghost",
+        "assignees": [a["login"] for a in pr["assignees"]["nodes"]],
+        "labels": [l["name"] for l in pr["labels"]["nodes"]],
+        "is_draft": pr["isDraft"],
+        "mergeable": pr["mergeable"],
+        "review_decision": pr["reviewDecision"]
+    }
+
+
+def _fetch_paginated_items(
+    repository: str,
+    query_builder: callable,
+    data_path: list[str],
+    parser: callable
+) -> dict[str, dict]:
+    """
+    Generic function to fetch paginated items from GitHub GraphQL API.
+
+    Args:
+        repository: Repository in "owner/repo" format
+        query_builder: Function that builds the GraphQL query with (owner, repo, cursor) params
+        data_path: Path to the data in the response (e.g., ["repository", "issues"])
+        parser: Function to parse each node
+
+    Returns:
+        Dictionary mapping item numbers to parsed item data
+    """
+    items = {}
+    has_next_page = True
+    end_cursor = None
+
+    while has_next_page:
+        try:
             result = run_command([
                 "gh", "api", "graphql",
-                "-f", f"query={paginated_query}"
+                "-f", f"query={query_builder(end_cursor)}"
             ])
 
             data = json.loads(result.stdout)
 
-            if "data" not in data or not data["data"]["repository"]:
+            # Navigate to the data using the path
+            current = data.get("data", {})
+            for key in data_path:
+                if current is None:
+                    print(f"Error: Invalid response from GraphQL API for {repository}", file=sys.stderr)
+                    return items
+                current = current.get(key)
+
+            if current is None:
                 print(f"Error: Invalid response from GraphQL API for {repository}", file=sys.stderr)
                 break
 
-            issues_data = data["data"]["repository"]["issues"]
+            # Process nodes
+            for node in current["nodes"]:
+                item_number = str(node["number"])
+                items[item_number] = parser(node)
 
-            for issue in issues_data["nodes"]:
-                issue_number = str(issue["number"])
-                issues[issue_number] = {
-                    "number": issue["number"],
-                    "title": issue["title"],
-                    "body": issue["body"],
-                    "url": issue["url"],
-                    "state": issue["state"],
-                    "created_at": issue["createdAt"],
-                    "updated_at": issue["updatedAt"],
-                    "closed_at": issue["closedAt"],
-                    "author": issue["author"]["login"] if issue["author"] else "ghost",
-                    "assignees": [a["login"] for a in issue["assignees"]["nodes"]],
-                    "labels": [l["name"] for l in issue["labels"]["nodes"]]
-                }
+            # Check pagination
+            has_next_page = current["pageInfo"]["hasNextPage"]
+            end_cursor = current["pageInfo"]["endCursor"]
 
-            # Check if there are more pages
-            has_next_page = issues_data["pageInfo"]["hasNextPage"]
-            end_cursor = issues_data["pageInfo"]["endCursor"]
+        except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, ValueError) as e:
+            print(f"Error fetching items for {repository}: {e}", file=sys.stderr)
+            break
 
-        return issues
-    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, ValueError) as e:
+    return items
+
+
+def get_open_issues(repository: str, updated_since: Optional[str] = None) -> dict[str, dict]:
+    """
+    Get the list of open issues and pull requests from GitHub using GraphQL API.
+
+    Args:
+        repository: Repository in "owner/repo" format
+        updated_since: Optional ISO8601 timestamp to filter issues/PRs updated since this time
+
+    Returns:
+        Dictionary mapping issue/PR numbers (as strings) to data dictionaries.
+        Each entry includes a "type" field set to either "issue" or "pr".
+    """
+    try:
+        owner, repo = repository.split("/")
+
+        # Build the filter clause
+        filter_clause = ""
+        if updated_since:
+            filter_clause = f', filterBy: {{since: "{updated_since}"}}'
+
+        # Create query builders with the specific parameters
+        def issue_query_builder(cursor):
+            return _build_issue_query(owner, repo, filter_clause, cursor)
+
+        def pr_query_builder(cursor):
+            return _build_pr_query(owner, repo, filter_clause, cursor)
+
+        # Fetch issues
+        items = _fetch_paginated_items(
+            repository,
+            issue_query_builder,
+            ["repository", "issues"],
+            _parse_issue_node
+        )
+
+        # Fetch pull requests
+        pr_items = _fetch_paginated_items(
+            repository,
+            pr_query_builder,
+            ["repository", "pullRequests"],
+            _parse_pr_node
+        )
+
+        # Merge PRs into items
+        items.update(pr_items)
+
+        return items
+    except (ValueError) as e:
         print(f"Error getting open issues for {repository}: {e}", file=sys.stderr)
         return {}
 
@@ -356,6 +455,144 @@ def save_last_checked(base_path: Path, repository: str, issue_number: str, times
         print(f"Error writing last checked file {timestamp_file}: {e}", file=sys.stderr)
 
 
+def _build_comment_query(owner: str, repo: str, number: str, item_type: str, cursor: Optional[str] = None) -> str:
+    """Build GraphQL query for fetching comments on issues or PRs."""
+    after_clause = f', after: "{cursor}"' if cursor else ""
+    type_name = "issue" if item_type == "issue" else "pullRequest"
+
+    return f"""
+    {{
+      repository(owner: "{owner}", name: "{repo}") {{
+        {type_name}(number: {number}) {{
+          comments(first: 100{after_clause}) {{
+            pageInfo {{
+              hasNextPage
+              endCursor
+            }}
+            nodes {{
+              id
+              databaseId
+              url
+              author {{
+                login
+              }}
+              authorAssociation
+              body
+              bodyText
+              createdAt
+              updatedAt
+              publishedAt
+              lastEditedAt
+              isMinimized
+              minimizedReason
+              reactions(first: 10) {{
+                totalCount
+                nodes {{
+                  content
+                  user {{
+                    login
+                  }}
+                }}
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+    """
+
+
+def _parse_comment_node(comment: dict) -> dict:
+    """Parse a GraphQL comment node into standardized format."""
+    return {
+        "id": comment["id"],
+        "database_id": comment["databaseId"],
+        "url": comment["url"],
+        "author": comment["author"]["login"] if comment["author"] else "ghost",
+        "author_association": comment["authorAssociation"],
+        "body": comment["body"],
+        "body_text": comment["bodyText"],
+        "created_at": comment["createdAt"],
+        "updated_at": comment["updatedAt"],
+        "published_at": comment["publishedAt"],
+        "last_edited_at": comment["lastEditedAt"],
+        "is_minimized": comment["isMinimized"],
+        "minimized_reason": comment["minimizedReason"],
+        "reactions": {
+            "total_count": comment["reactions"]["totalCount"],
+            "items": [
+                {
+                    "content": r["content"],
+                    "user": r["user"]["login"] if r["user"] else "ghost"
+                }
+                for r in comment["reactions"]["nodes"]
+            ]
+        }
+    }
+
+
+def _fetch_paginated_comments(
+    repository: str,
+    number: str,
+    item_type: str,
+    updated_since: Optional[str] = None
+) -> list[dict]:
+    """
+    Generic function to fetch paginated comments from GitHub GraphQL API.
+
+    Args:
+        repository: Repository in "owner/repo" format
+        number: Issue or PR number
+        item_type: Either "issue" or "pr"
+        updated_since: Optional ISO8601 timestamp to filter comments
+
+    Returns:
+        List of parsed comment dictionaries
+    """
+    try:
+        owner, repo = repository.split("/")
+        comments = []
+        has_next_page = True
+        end_cursor = None
+
+        while has_next_page:
+            query = _build_comment_query(owner, repo, number, item_type, end_cursor)
+
+            result = run_command([
+                "gh", "api", "graphql",
+                "-f", f"query={query}"
+            ])
+
+            data = json.loads(result.stdout)
+
+            # Navigate to the correct data path
+            type_key = "issue" if item_type == "issue" else "pullRequest"
+            if "data" not in data or not data["data"]["repository"] or not data["data"]["repository"][type_key]:
+                print(f"Error: Invalid response from GraphQL API for {repository}#{number}", file=sys.stderr)
+                break
+
+            item_data = data["data"]["repository"][type_key]
+            comment_data = item_data["comments"]
+
+            for comment in comment_data["nodes"]:
+                # Filter by updated_since if provided
+                if updated_since:
+                    comment_updated = comment["updatedAt"]
+                    if comment_updated <= updated_since:
+                        continue
+
+                comments.append(_parse_comment_node(comment))
+
+            # Check pagination
+            has_next_page = comment_data["pageInfo"]["hasNextPage"]
+            end_cursor = comment_data["pageInfo"]["endCursor"]
+
+        return comments
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, ValueError) as e:
+        print(f"Error getting comments for {repository}#{number}: {e}", file=sys.stderr)
+        return []
+
+
 def get_issue_comments(repository: str, issue_number: str, updated_since: Optional[str] = None) -> list[dict]:
     """
     Get comments on an issue from GitHub using GraphQL API.
@@ -368,156 +605,7 @@ def get_issue_comments(repository: str, issue_number: str, updated_since: Option
     Returns:
         List of comment dictionaries with all available fields from GraphQL
     """
-    try:
-        owner, repo = repository.split("/")
-
-        # Build the GraphQL query
-        query = f"""
-        {{
-          repository(owner: "{owner}", name: "{repo}") {{
-            issue(number: {issue_number}) {{
-              comments(first: 100) {{
-                pageInfo {{
-                  hasNextPage
-                  endCursor
-                }}
-                nodes {{
-                  id
-                  databaseId
-                  url
-                  author {{
-                    login
-                  }}
-                  authorAssociation
-                  body
-                  bodyText
-                  createdAt
-                  updatedAt
-                  publishedAt
-                  lastEditedAt
-                  isMinimized
-                  minimizedReason
-                  reactions(first: 10) {{
-                    totalCount
-                    nodes {{
-                      content
-                      user {{
-                        login
-                      }}
-                    }}
-                  }}
-                }}
-              }}
-            }}
-          }}
-        }}
-        """
-
-        comments = []
-        has_next_page = True
-        end_cursor = None
-
-        while has_next_page:
-            # Update query with pagination cursor if needed
-            if end_cursor:
-                paginated_query = f"""
-                {{
-                  repository(owner: "{owner}", name: "{repo}") {{
-                    issue(number: {issue_number}) {{
-                      comments(first: 100, after: "{end_cursor}") {{
-                        pageInfo {{
-                          hasNextPage
-                          endCursor
-                        }}
-                        nodes {{
-                          id
-                          databaseId
-                          url
-                          author {{
-                            login
-                          }}
-                          authorAssociation
-                          body
-                          bodyText
-                          createdAt
-                          updatedAt
-                          publishedAt
-                          lastEditedAt
-                          isMinimized
-                          minimizedReason
-                          reactions(first: 10) {{
-                            totalCount
-                            nodes {{
-                              content
-                              user {{
-                                login
-                              }}
-                            }}
-                          }}
-                        }}
-                      }}
-                    }}
-                  }}
-                }}
-                """
-            else:
-                paginated_query = query
-
-            result = run_command([
-                "gh", "api", "graphql",
-                "-f", f"query={paginated_query}"
-            ])
-
-            data = json.loads(result.stdout)
-
-            if "data" not in data or not data["data"]["repository"] or not data["data"]["repository"]["issue"]:
-                print(f"Error: Invalid response from GraphQL API for {repository}#{issue_number}", file=sys.stderr)
-                break
-
-            issue_data = data["data"]["repository"]["issue"]
-            comment_data = issue_data["comments"]
-
-            for comment in comment_data["nodes"]:
-                # Filter by updated_since if provided
-                if updated_since:
-                    comment_updated = comment["updatedAt"]
-                    if comment_updated <= updated_since:
-                        continue
-
-                comments.append({
-                    "id": comment["id"],
-                    "database_id": comment["databaseId"],
-                    "url": comment["url"],
-                    "author": comment["author"]["login"] if comment["author"] else "ghost",
-                    "author_association": comment["authorAssociation"],
-                    "body": comment["body"],
-                    "body_text": comment["bodyText"],
-                    "created_at": comment["createdAt"],
-                    "updated_at": comment["updatedAt"],
-                    "published_at": comment["publishedAt"],
-                    "last_edited_at": comment["lastEditedAt"],
-                    "is_minimized": comment["isMinimized"],
-                    "minimized_reason": comment["minimizedReason"],
-                    "reactions": {
-                        "total_count": comment["reactions"]["totalCount"],
-                        "items": [
-                            {
-                                "content": r["content"],
-                                "user": r["user"]["login"] if r["user"] else "ghost"
-                            }
-                            for r in comment["reactions"]["nodes"]
-                        ]
-                    }
-                })
-
-            # Check if there are more pages
-            has_next_page = comment_data["pageInfo"]["hasNextPage"]
-            end_cursor = comment_data["pageInfo"]["endCursor"]
-
-        return comments
-    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, ValueError) as e:
-        print(f"Error getting comments for {repository}#{issue_number}: {e}", file=sys.stderr)
-        return []
+    return _fetch_paginated_comments(repository, issue_number, "issue", updated_since)
 
 
 def get_type_from_file(base_path: Path, repository: str, number: str) -> Optional[str]:
@@ -617,156 +705,7 @@ def get_pr_comments(repository: str, pr_number: str, updated_since: Optional[str
     Returns:
         List of comment dictionaries with all available fields from GraphQL
     """
-    try:
-        owner, repo = repository.split("/")
-
-        # Build the GraphQL query
-        query = f"""
-        {{
-          repository(owner: "{owner}", name: "{repo}") {{
-            pullRequest(number: {pr_number}) {{
-              comments(first: 100) {{
-                pageInfo {{
-                  hasNextPage
-                  endCursor
-                }}
-                nodes {{
-                  id
-                  databaseId
-                  url
-                  author {{
-                    login
-                  }}
-                  authorAssociation
-                  body
-                  bodyText
-                  createdAt
-                  updatedAt
-                  publishedAt
-                  lastEditedAt
-                  isMinimized
-                  minimizedReason
-                  reactions(first: 10) {{
-                    totalCount
-                    nodes {{
-                      content
-                      user {{
-                        login
-                      }}
-                    }}
-                  }}
-                }}
-              }}
-            }}
-          }}
-        }}
-        """
-
-        comments = []
-        has_next_page = True
-        end_cursor = None
-
-        while has_next_page:
-            # Update query with pagination cursor if needed
-            if end_cursor:
-                paginated_query = f"""
-                {{
-                  repository(owner: "{owner}", name: "{repo}") {{
-                    pullRequest(number: {pr_number}) {{
-                      comments(first: 100, after: "{end_cursor}") {{
-                        pageInfo {{
-                          hasNextPage
-                          endCursor
-                        }}
-                        nodes {{
-                          id
-                          databaseId
-                          url
-                          author {{
-                            login
-                          }}
-                          authorAssociation
-                          body
-                          bodyText
-                          createdAt
-                          updatedAt
-                          publishedAt
-                          lastEditedAt
-                          isMinimized
-                          minimizedReason
-                          reactions(first: 10) {{
-                            totalCount
-                            nodes {{
-                              content
-                              user {{
-                                login
-                              }}
-                            }}
-                          }}
-                        }}
-                      }}
-                    }}
-                  }}
-                }}
-                """
-            else:
-                paginated_query = query
-
-            result = run_command([
-                "gh", "api", "graphql",
-                "-f", f"query={paginated_query}"
-            ])
-
-            data = json.loads(result.stdout)
-
-            if "data" not in data or not data["data"]["repository"] or not data["data"]["repository"]["pullRequest"]:
-                print(f"Error: Invalid response from GraphQL API for {repository}#{pr_number}", file=sys.stderr)
-                break
-
-            pr_data = data["data"]["repository"]["pullRequest"]
-            comment_data = pr_data["comments"]
-
-            for comment in comment_data["nodes"]:
-                # Filter by updated_since if provided
-                if updated_since:
-                    comment_updated = comment["updatedAt"]
-                    if comment_updated <= updated_since:
-                        continue
-
-                comments.append({
-                    "id": comment["id"],
-                    "database_id": comment["databaseId"],
-                    "url": comment["url"],
-                    "author": comment["author"]["login"] if comment["author"] else "ghost",
-                    "author_association": comment["authorAssociation"],
-                    "body": comment["body"],
-                    "body_text": comment["bodyText"],
-                    "created_at": comment["createdAt"],
-                    "updated_at": comment["updatedAt"],
-                    "published_at": comment["publishedAt"],
-                    "last_edited_at": comment["lastEditedAt"],
-                    "is_minimized": comment["isMinimized"],
-                    "minimized_reason": comment["minimizedReason"],
-                    "reactions": {
-                        "total_count": comment["reactions"]["totalCount"],
-                        "items": [
-                            {
-                                "content": r["content"],
-                                "user": r["user"]["login"] if r["user"] else "ghost"
-                            }
-                            for r in comment["reactions"]["nodes"]
-                        ]
-                    }
-                })
-
-            # Check if there are more pages
-            has_next_page = comment_data["pageInfo"]["hasNextPage"]
-            end_cursor = comment_data["pageInfo"]["endCursor"]
-
-        return comments
-    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, ValueError) as e:
-        print(f"Error getting comments for {repository}#{pr_number}: {e}", file=sys.stderr)
-        return []
+    return _fetch_paginated_comments(repository, pr_number, "pr", updated_since)
 
 
 async def publish_event(js, subject: str, data: dict) -> None:
@@ -828,17 +767,17 @@ async def monitor_repositories(
     updated_since: Optional[str] = None
 ) -> int:
     """
-    Monitor repositories and publish events for new open issues.
+    Monitor repositories and publish events for new open issues and PRs.
 
     Args:
         js: JetStream context
         base_path: Base path for issue directories
         repositories: List of repositories to monitor
         dry_run: If True, don't publish events
-        updated_since: Optional ISO8601 timestamp to filter issues updated since this time
+        updated_since: Optional ISO8601 timestamp to filter issues/PRs updated since this time
 
     Returns:
-        Number of new issues discovered
+        Number of new issues/PRs discovered
     """
     new_issues_count = 0
     current_time = datetime.now(timezone.utc).isoformat()
@@ -849,32 +788,39 @@ async def monitor_repositories(
         else:
             print(f"Fetching open issues for {repository}...")
 
-        open_issues = get_open_issues(repository, updated_since)
+        open_items = get_open_issues(repository, updated_since)
 
-        if not open_issues:
-            print(f"  No open issues found or error fetching issues")
+        if not open_items:
+            print(f"  No open issues/PRs found or error fetching")
             continue
 
-        print(f"  Found {len(open_issues)} open issue(s)")
+        print(f"  Found {len(open_items)} open issue(s)/PR(s)")
 
-        for issue_number, issue_data in open_issues.items():
-            issue_dir = base_path / repository / issue_number
+        for number, item_data in open_items.items():
+            item_dir = base_path / repository / number
+            item_type = item_data.get("type", "issue")
 
-            if not issue_dir.exists():
-                print(f"    New issue discovered: {repository}#{issue_number}")
+            if not item_dir.exists():
+                if item_type == "pr":
+                    print(f"    New PR discovered: {repository}#{number}")
+                    event_subject = "github.pr.new"
+                else:
+                    print(f"    New issue discovered: {repository}#{number}")
+                    event_subject = "github.issue.new"
+
                 event_data = {
                     "repository": repository,
-                    **issue_data  # Include all issue data from GraphQL
+                    **item_data  # Include all item data from GraphQL
                 }
 
                 if dry_run:
-                    print(f"    [DRY RUN] Would publish github.issue.new event")
+                    print(f"    [DRY RUN] Would publish {event_subject} event")
                     print(f"    [DRY RUN] Would save .last_checked timestamp")
-                    print(f"    [DRY RUN] Would save .type file as 'issue'")
+                    print(f"    [DRY RUN] Would save .type file as '{item_type}'")
                 else:
-                    await publish_event(js, "github.issue.new", event_data)
-                    save_last_checked(base_path, repository, issue_number, current_time)
-                    save_type_to_file(base_path, repository, issue_number, "issue")
+                    await publish_event(js, event_subject, event_data)
+                    save_last_checked(base_path, repository, number, current_time)
+                    save_type_to_file(base_path, repository, number, item_type)
                     new_issues_count += 1
 
         print()
@@ -888,7 +834,7 @@ async def process_active_issues(
     active_issues: list[tuple[str, str]],
     dry_run: bool = False
 ) -> None:
-    """Process all active issues and publish appropriate events."""
+    """Process all active issues and PRs and publish appropriate events."""
     current_time = datetime.now(timezone.utc).isoformat()
 
     # Group issues by repository
@@ -900,47 +846,63 @@ async def process_active_issues(
 
     # Process each repository
     for repository, issue_numbers in issues_by_repo.items():
-        print(f"Checking open issues for {repository}...")
-        open_issues = get_open_issues(repository)
+        print(f"Checking open issues/PRs for {repository}...")
+        open_items = get_open_issues(repository)
 
-        if not open_issues and len(issue_numbers) > 0:
-            print(f"  Warning: Could not fetch open issues for {repository}")
+        if not open_items and len(issue_numbers) > 0:
+            print(f"  Warning: Could not fetch open issues/PRs for {repository}")
             continue
 
-        # Process each issue for this repository
-        for issue_number in issue_numbers:
-            print(f"  Processing {repository}#{issue_number}...")
+        # Process each issue/PR for this repository
+        for number in issue_numbers:
+            print(f"  Processing {repository}#{number}...")
 
-            if issue_number in open_issues:
-                issue_data = open_issues[issue_number]
+            if number in open_items:
+                item_data = open_items[number]
+                item_type = item_data.get("type", "issue")
+
                 event_data = {
                     "repository": repository,
-                    "issue_number": issue_number,
-                    **issue_data  # Include all issue data from GraphQL
+                    "number": number,
+                    **item_data  # Include all item data from GraphQL
                 }
 
-                print(f"    Issue is still open")
+                if item_type == "pr":
+                    print(f"    PR is still open")
+                    event_subject = "github.pr.updated"
+                else:
+                    print(f"    Issue is still open")
+                    event_subject = "github.issue.updated"
+
                 if dry_run:
-                    print(f"    [DRY RUN] Would publish github.issue.updated event")
+                    print(f"    [DRY RUN] Would publish {event_subject} event")
                     print(f"    [DRY RUN] Would save .last_checked timestamp")
                 else:
-                    await publish_event(js, "github.issue.updated", event_data)
-                    save_last_checked(base_path, repository, issue_number, current_time)
+                    await publish_event(js, event_subject, event_data)
+                    save_last_checked(base_path, repository, number, current_time)
             else:
-                # For closed issues, we don't have the data from GraphQL since it only returns open issues
-                # But we can still include basic info
+                # For closed items, we don't have the data from GraphQL since it only returns open items
+                # But we can still check the cached type and include basic info
+                cached_type = get_type_from_file(base_path, repository, number)
+
                 event_data = {
                     "repository": repository,
-                    "issue_number": issue_number
+                    "number": number
                 }
 
-                print(f"    Issue is closed")
+                if cached_type == "pr":
+                    print(f"    PR is closed")
+                    event_subject = "github.pr.closed"
+                else:
+                    print(f"    Issue is closed")
+                    event_subject = "github.issue.closed"
+
                 if dry_run:
-                    print(f"    [DRY RUN] Would publish github.issue.closed event")
+                    print(f"    [DRY RUN] Would publish {event_subject} event")
                     print(f"    [DRY RUN] Would save .last_checked timestamp")
                 else:
-                    await publish_event(js, "github.issue.closed", event_data)
-                    save_last_checked(base_path, repository, issue_number, current_time)
+                    await publish_event(js, event_subject, event_data)
+                    save_last_checked(base_path, repository, number, current_time)
 
         print()
 
@@ -967,11 +929,6 @@ async def monitor_issue_comments(
     current_time = datetime.now(timezone.utc).isoformat()
 
     for repository, issue_number in active_issues:
-        # First check if this is actually an issue (not a PR)
-        if is_pull_request(repository, issue_number, base_path):
-            print(f"Skipping {repository}#{issue_number} - is a pull request, not an issue")
-            continue
-
         # Get the last time we checked for comments
         last_check = get_last_comment_check(base_path, repository, issue_number, "issue")
 
@@ -1030,11 +987,6 @@ async def monitor_pr_comments(
     current_time = datetime.now(timezone.utc).isoformat()
 
     for repository, pr_number in active_prs:
-        # First check if this is actually a PR
-        if not is_pull_request(repository, pr_number, base_path):
-            print(f"Skipping {repository}#{pr_number} - not a pull request")
-            continue
-
         # Get the last time we checked for comments
         last_check = get_last_comment_check(base_path, repository, pr_number, "pr")
 
@@ -1099,43 +1051,58 @@ async def main_async(args):
 
         print(f"Tracking repositories: {', '.join(repositories)}\n")
 
-        # Monitor repositories and publish events for new issues (if enabled)
+        # Monitor repositories and publish events for new issues/PRs (if enabled)
         if args.monitor_issues:
             new_count = await monitor_repositories(
                 js, args.path, repositories, args.dry_run, args.updated_since
             )
             if new_count > 0:
-                print(f"Discovered {new_count} new issue{'s' if new_count != 1 else ''}\n")
+                print(f"Discovered {new_count} new issue(s)/PR(s)\n")
 
-        # Find all active issues (if issue monitoring is enabled)
+        # Find all active issues/PRs (if issue monitoring is enabled)
         active_issues = []
+        active_prs = []
         if args.monitor_issues:
             if args.active_only:
-                print(f"Scanning {args.path} for active issues (with .active flag)...")
+                print(f"Scanning {args.path} for active issues/PRs (with .active flag)...")
             else:
-                print(f"Scanning {args.path} for all issues...")
-            active_issues = find_active_issues(args.path, args.active_only)
+                print(f"Scanning {args.path} for all issues/PRs...")
+            all_active_items = find_active_issues(args.path, args.active_only)
 
-            if not active_issues:
-                print("No active issues found.")
+            if not all_active_items:
+                print("No active issues/PRs found.")
                 # Don't return early - we might still want to monitor comments
             else:
-                print(f"Found {len(active_issues)} active issue(s)\n")
+                # Separate issues from PRs
+                for repository, number in all_active_items:
+                    if is_pull_request(repository, number, args.path):
+                        active_prs.append((repository, number))
+                    else:
+                        active_issues.append((repository, number))
 
-                # Process active issues and publish events
-                await process_active_issues(js, args.path, active_issues, args.dry_run)
+                print(f"Found {len(active_issues)} active issue(s) and {len(active_prs)} active PR(s)\n")
+
+                # Process active issues/PRs and publish events
+                await process_active_issues(js, args.path, all_active_items, args.dry_run)
         elif args.monitor_issue_comments or args.monitor_pr_comments:
             # If comment monitoring is enabled but issue monitoring is not,
-            # still need to find active issues for comment checking
+            # still need to find active issues/PRs for comment checking
             if args.active_only:
-                print(f"Scanning {args.path} for active issues (with .active flag, for comment monitoring)...")
+                print(f"Scanning {args.path} for active issues/PRs (with .active flag, for comment monitoring)...")
             else:
-                print(f"Scanning {args.path} for all issues (for comment monitoring)...")
-            active_issues = find_active_issues(args.path, args.active_only)
-            if not active_issues:
-                print("No active issues found.")
+                print(f"Scanning {args.path} for all issues/PRs (for comment monitoring)...")
+            all_active_items = find_active_issues(args.path, args.active_only)
+            if not all_active_items:
+                print("No active issues/PRs found.")
             else:
-                print(f"Found {len(active_issues)} active issue(s)\n")
+                # Separate issues from PRs
+                for repository, number in all_active_items:
+                    if is_pull_request(repository, number, args.path):
+                        active_prs.append((repository, number))
+                    else:
+                        active_issues.append((repository, number))
+
+                print(f"Found {len(active_issues)} active issue(s) and {len(active_prs)} active PR(s)\n")
 
         # Monitor issue comments if enabled
         if args.monitor_issue_comments and active_issues:
@@ -1147,11 +1114,9 @@ async def main_async(args):
                 print()
 
         # Monitor PR comments if enabled
-        if args.monitor_pr_comments and active_issues:
+        if args.monitor_pr_comments and active_prs:
             print("Monitoring PR comments...")
-            # Filter active issues to find those that are PRs (you may need to adjust this logic)
-            # For now, we'll treat all active issues as potential PRs to check
-            pr_count = await monitor_pr_comments(js, args.path, active_issues, args.dry_run)
+            pr_count = await monitor_pr_comments(js, args.path, active_prs, args.dry_run)
             if pr_count > 0:
                 print(f"Found {pr_count} new PR comment{'s' if pr_count != 1 else ''}\n")
             else:
@@ -1190,13 +1155,13 @@ def main():
     )
     parser.add_argument(
         "--updated-since",
-        help="Filter issues updated since this ISO8601 timestamp (e.g., 2024-01-01T00:00:00Z)"
+        help="Filter issues/PRs updated since this ISO8601 timestamp (e.g., 2024-01-01T00:00:00Z)"
     )
     parser.add_argument(
         "--monitor-issues",
         default=True,
         action=argparse.BooleanOptionalAction,
-        help="Monitor and publish events for issues (new, updated, closed)"
+        help="Monitor and publish events for issues and PRs (new, updated, closed)"
     )
     parser.add_argument(
         "--monitor-issue-comments",
@@ -1214,7 +1179,7 @@ def main():
         "--active-only",
         default=True,
         action=argparse.BooleanOptionalAction,
-        help="Only monitor issues with .active flag (default: True). Use --no-active-only to monitor all issue directories."
+        help="Only monitor issues/PRs with .active flag (default: True). Use --no-active-only to monitor all directories."
     )
 
     args = parser.parse_args()
