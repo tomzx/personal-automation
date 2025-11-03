@@ -1,15 +1,20 @@
 """
-Handle GitHub issue events from NATS JetStream.
+Handle GitHub issue and PR events from NATS JetStream.
 
 This script:
-1. Consumes GitHub issue events from a JetStream stream with retention limits
+1. Consumes GitHub issue and PR events from a JetStream stream with retention limits
 2. Uses a durable consumer to track message processing state
 3. Handles different event types:
    - github.issue.new: Creates directory structure for new issues
-   - github.issue.process: Invokes claude to process active issues
+   - github.issue.updated: Invokes claude to process active issues
    - github.issue.closed: Removes .active file to mark issues as inactive
+   - github.pr.new: Creates directory structure for new PRs
+   - github.pr.updated: Invokes claude to process active PRs
+   - github.pr.closed: Removes .active file to mark PRs as inactive
+   - github.issue.comment.new: Handles new comments on issues
+   - github.pr.comment.new: Handles new comments on PRs
 
-Directory structure: {base_path}/{owner}/{repo}/{issue_number}/
+Directory structure: {base_path}/{owner}/{repo}/{issue_or_pr_number}/
 """
 
 # /// script
@@ -94,7 +99,7 @@ def remove_active_file(base_path: Path, repository: str, issue_number: str) -> b
 def invoke_claude(base_path: Path, repository: str, issue_number: str) -> bool:
     """Invoke claude with the /prepare-issue command."""
     try:
-        cmd = ["claude", "-p", f"/prepare-issue {repository} {issue_number} BASE_DIR={base_path}"]
+        cmd = ["claude", "-p", f"/prepare-issue REPOSITORY={repository} NUMBER={issue_number} BASE_DIR={base_path}"]
         run_command(cmd, capture_output=False)
         return True
     except subprocess.CalledProcessError as e:
@@ -103,50 +108,109 @@ def invoke_claude(base_path: Path, repository: str, issue_number: str) -> bool:
 
 
 class EventHandler:
-    """Handle GitHub issue events."""
+    """Handle GitHub issue and PR events."""
 
-    def __init__(self, claude_available: bool = True):
+    def __init__(self, base_path: Path, claude_available: bool = True):
+        self.base_path = base_path
         self.claude_available = claude_available
 
     async def handle_new_issue(self, data: dict) -> None:
         """Handle github.issue.new event."""
         repository = data["repository"]
         issue_number = data["issue_number"]
-        base_path = Path(data["base_path"])
 
-        print(f"[NEW] Creating directory for {repository}#{issue_number}")
-        issue_dir = create_issue_directory(base_path, repository, issue_number)
-        print(f"[NEW] Created directory: {issue_dir}")
+        print(f"[NEW ISSUE] Creating directory for {repository}#{issue_number}")
+        issue_dir = create_issue_directory(self.base_path, repository, issue_number)
+        print(f"[NEW ISSUE] Created directory: {issue_dir}")
 
-    async def handle_process_issue(self, data: dict) -> None:
-        """Handle github.issue.process event."""
+    async def handle_updated_issue(self, data: dict) -> None:
+        """Handle github.issue.updated event."""
         repository = data["repository"]
         issue_number = data["issue_number"]
-        base_path = Path(data["base_path"])
 
-        print(f"[PROCESS] Processing {repository}#{issue_number}")
+        print(f"[UPDATE ISSUE] Processing {repository}#{issue_number}")
 
         if not self.claude_available:
-            print(f"[PROCESS] Claude CLI not available, skipping invocation")
+            print(f"[UPDATE ISSUE] Claude CLI not available, skipping invocation")
             return
 
-        if invoke_claude(base_path, repository, issue_number):
-            print(f"[PROCESS] Successfully invoked claude")
+        if invoke_claude(self.base_path, repository, issue_number):
+            print(f"[UPDATE ISSUE] Successfully invoked claude")
         else:
-            print(f"[PROCESS] Failed to invoke claude")
+            print(f"[UPDATE ISSUE] Failed to invoke claude")
 
     async def handle_closed_issue(self, data: dict) -> None:
         """Handle github.issue.closed event."""
         repository = data["repository"]
         issue_number = data["issue_number"]
-        base_path = Path(data["base_path"])
 
-        print(f"[CLOSED] Marking {repository}#{issue_number} as inactive")
-        if remove_active_file(base_path, repository, issue_number):
-            issue_dir = base_path / repository / issue_number
-            print(f"[CLOSED] Removed .active file from {issue_dir}")
+        print(f"[CLOSE ISSUE] Marking {repository}#{issue_number} as inactive")
+        if remove_active_file(self.base_path, repository, issue_number):
+            issue_dir = self.base_path / repository / issue_number
+            print(f"[CLOSE ISSUE] Removed .active file from {issue_dir}")
         else:
-            print(f"[CLOSED] Failed to remove .active file")
+            print(f"[CLOSE ISSUE] Failed to remove .active file")
+
+    async def handle_new_pr(self, data: dict) -> None:
+        """Handle github.pr.new event."""
+        repository = data["repository"]
+        pr_number = data["pr_number"]
+
+        print(f"[NEW PR] Creating directory for {repository}#{pr_number}")
+        pr_dir = create_issue_directory(self.base_path, repository, pr_number)
+        print(f"[NEW PR] Created directory: {pr_dir}")
+
+    async def handle_updated_pr(self, data: dict) -> None:
+        """Handle github.pr.updated event."""
+        repository = data["repository"]
+        pr_number = data["pr_number"]
+
+        print(f"[UPDATE PR] Processing {repository}#{pr_number}")
+
+        if not self.claude_available:
+            print(f"[UPDATE PR] Claude CLI not available, skipping invocation")
+            return
+
+        if invoke_claude(self.base_path, repository, pr_number):
+            print(f"[UPDATE PR] Successfully invoked claude")
+        else:
+            print(f"[UPDATE PR] Failed to invoke claude")
+
+    async def handle_closed_pr(self, data: dict) -> None:
+        """Handle github.pr.closed event."""
+        repository = data["repository"]
+        pr_number = data["pr_number"]
+
+        print(f"[CLOSE PR] Marking {repository}#{pr_number} as inactive")
+        if remove_active_file(self.base_path, repository, pr_number):
+            pr_dir = self.base_path / repository / pr_number
+            print(f"[CLOSE PR] Removed .active file from {pr_dir}")
+        else:
+            print(f"[CLOSE PR] Failed to remove .active file")
+
+    async def handle_issue_comment(self, data: dict) -> None:
+        """Handle github.issue.comment.new event."""
+        repository = data["repository"]
+        issue_number = data["issue_number"]
+        comment = data["comment"]
+
+        print(f"[ISSUE COMMENT] New comment on {repository}#{issue_number}")
+        print(f"[ISSUE COMMENT] Author: {comment['author']}")
+        print(f"[ISSUE COMMENT] Created: {comment['created_at']}")
+        print(f"[ISSUE COMMENT] URL: {comment['url']}")
+        # For now, just log the comment. Could add claude invocation or other actions here.
+
+    async def handle_pr_comment(self, data: dict) -> None:
+        """Handle github.pr.comment.new event."""
+        repository = data["repository"]
+        pr_number = data["pr_number"]
+        comment = data["comment"]
+
+        print(f"[PR COMMENT] New comment on {repository}#{pr_number}")
+        print(f"[PR COMMENT] Author: {comment['author']}")
+        print(f"[PR COMMENT] Created: {comment['created_at']}")
+        print(f"[PR COMMENT] URL: {comment['url']}")
+        # For now, just log the comment. Could add claude invocation or other actions here.
 
 
 async def message_handler(msg, handler: EventHandler):
@@ -158,10 +222,23 @@ async def message_handler(msg, handler: EventHandler):
 
         if subject == "github.issue.new":
             await handler.handle_new_issue(data)
-        elif subject == "github.issue.process":
-            await handler.handle_process_issue(data)
+        elif subject == "github.issue.updated":
+            await handler.handle_updated_issue(data)
         elif subject == "github.issue.closed":
             await handler.handle_closed_issue(data)
+        elif subject == "github.pr.new":
+            await handler.handle_new_pr(data)
+        elif subject == "github.pr.updated":
+            await handler.handle_updated_pr(data)
+        elif subject == "github.pr.closed":
+            await handler.handle_closed_pr(data)
+        elif subject == "github.issue.comment.new":
+            await handler.handle_issue_comment(data)
+        elif subject == "github.pr.comment.new":
+            await handler.handle_pr_comment(data)
+        # Keep backward compatibility with github.issue.process
+        elif subject == "github.issue.process":
+            await handler.handle_updated_issue(data)
         else:
             print(f"Unknown subject: {subject}")
 
@@ -189,7 +266,7 @@ async def main_async(args):
         print()
 
     # Create event handler
-    handler = EventHandler(claude_available=claude_available)
+    handler = EventHandler(base_path=args.path, claude_available=claude_available)
 
     # Connect to NATS
     nc = NATS()
@@ -207,7 +284,7 @@ async def main_async(args):
         # This creates or uses an existing durable consumer
         print(f"Creating pull subscription to stream '{args.stream}' with consumer '{args.consumer}'...")
         psub = await js.pull_subscribe(
-            "github.issue.*",  # Subscribe to all GitHub issue events
+            "github.*",  # Subscribe to all GitHub events (issues, PRs, and comments)
             durable=args.consumer,
             stream=args.stream,
         )
@@ -244,34 +321,40 @@ async def main_async(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Handle GitHub issue events from NATS JetStream"
+        description="Handle GitHub issue and PR events from NATS JetStream",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument(
+        "path",
+        type=Path,
+        help="Base path containing repository/issue_number directories"
     )
     parser.add_argument(
         "--nats-server",
         default="nats://localhost:4222",
-        help="NATS server URL (default: nats://localhost:4222)"
+        help="NATS server URL"
     )
     parser.add_argument(
         "--stream",
         default="GITHUB_EVENTS",
-        help="JetStream stream name (default: GITHUB_EVENTS)"
+        help="JetStream stream name"
     )
     parser.add_argument(
         "--consumer",
         default="github-event-handler",
-        help="Durable consumer name (default: github-event-handler)"
+        help="Durable consumer name"
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=10,
-        help="Number of messages to fetch per batch (default: 10)"
+        help="Number of messages to fetch per batch"
     )
     parser.add_argument(
         "--fetch-timeout",
         type=float,
         default=5.0,
-        help="Timeout in seconds for fetching messages (default: 5.0)"
+        help="Timeout in seconds for fetching messages"
     )
 
     args = parser.parse_args()
