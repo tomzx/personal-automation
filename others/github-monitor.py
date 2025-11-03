@@ -73,7 +73,7 @@ def check_gh_installed() -> bool:
         return False
 
 
-def find_active_issues(base_path: Path, active_only: bool = True) -> list[tuple[str, str]]:
+def find_active_issues(base_path: Path, active_only: bool = True, repositories: Optional[list[str]] = None) -> list[tuple[str, str]]:
     """
     Find all active issues and PRs by scanning directories.
     Directory structure is assumed to be {base_path}/{owner/repo}/{issue_or_pr_number}.
@@ -81,6 +81,7 @@ def find_active_issues(base_path: Path, active_only: bool = True) -> list[tuple[
     Args:
         base_path: Base path containing repository directories
         active_only: If True, only return issues/PRs with .active files. If False, return all.
+        repositories: Optional list of repositories to filter by (format: owner/repo). If None, scan all.
 
     Returns:
         List of tuples: (repository in owner/repo format, issue_or_pr_number)
@@ -105,6 +106,10 @@ def find_active_issues(base_path: Path, active_only: bool = True) -> list[tuple[
 
             repo_name = repo_dir.name
             repository = f"{owner}/{repo_name}"
+
+            # Skip if repositories filter is provided and this repo is not in it
+            if repositories is not None and repository not in repositories:
+                continue
 
             # Scan for issue number directories
             for issue_dir in repo_dir.iterdir():
@@ -949,6 +954,159 @@ async def process_active_issues(
         print()
 
 
+def get_repository_last_comment_check(base_path: Path, repository: str, check_type: str = "issue") -> Optional[str]:
+    """
+    Get the earliest last comment check timestamp for all issues/PRs in a repository.
+    This allows us to fetch all comments since the earliest check with a single query.
+
+    Args:
+        base_path: Base path for issue directories
+        repository: Repository in "owner/repo" format
+        check_type: Type of check ("issue" or "pr")
+
+    Returns:
+        ISO8601 timestamp string of the earliest last check, or None if never checked
+    """
+    repo_path = base_path / repository
+    if not repo_path.exists():
+        return None
+
+    earliest_timestamp = None
+
+    for issue_dir in repo_path.iterdir():
+        if not issue_dir.is_dir():
+            continue
+
+        timestamp_file = issue_dir / f".last_{check_type}_comment_check"
+        if timestamp_file.exists():
+            try:
+                timestamp = timestamp_file.read_text().strip()
+                if earliest_timestamp is None or timestamp < earliest_timestamp:
+                    earliest_timestamp = timestamp
+            except Exception as e:
+                print(f"Error reading timestamp file {timestamp_file}: {e}", file=sys.stderr)
+
+    return earliest_timestamp
+
+
+def get_all_repository_comments(repository: str, item_type: str, updated_since: Optional[str] = None) -> dict[str, list[dict]]:
+    """
+    Get all comments on issues or PRs in a repository using a single GraphQL query.
+
+    Args:
+        repository: Repository in "owner/repo" format
+        item_type: Either "issue" or "pr"
+        updated_since: Optional ISO8601 timestamp to filter comments updated since this time
+
+    Returns:
+        Dictionary mapping issue/PR numbers (as strings) to lists of comment dictionaries
+    """
+    try:
+        owner, repo = repository.split("/")
+        type_name = "issues" if item_type == "issue" else "pullRequests"
+        singular_type = "issue" if item_type == "issue" else "pullRequest"
+
+        # Build filter clause for updated_since (only issues support filterBy)
+        filter_clause = ""
+        if updated_since and item_type == "issue":
+            filter_clause = f', filterBy: {{since: "{updated_since}"}}'
+
+        has_next_page = True
+        end_cursor = None
+        comments_by_number: dict[str, list[dict]] = {}
+
+        while has_next_page:
+            after_clause = f', after: "{end_cursor}"' if end_cursor else ""
+
+            # Query to get all open items with their comments
+            query = f"""
+            {{
+              repository(owner: "{owner}", name: "{repo}") {{
+                {type_name}(first: 100, states: OPEN{after_clause}{filter_clause}) {{
+                  pageInfo {{
+                    hasNextPage
+                    endCursor
+                  }}
+                  nodes {{
+                    number
+                    comments(first: 100, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+                      pageInfo {{
+                        hasNextPage
+                        endCursor
+                      }}
+                      nodes {{
+                        id
+                        databaseId
+                        url
+                        author {{
+                          login
+                        }}
+                        authorAssociation
+                        body
+                        bodyText
+                        createdAt
+                        updatedAt
+                        publishedAt
+                        lastEditedAt
+                        isMinimized
+                        minimizedReason
+                        reactions(first: 10) {{
+                          totalCount
+                          nodes {{
+                            content
+                            user {{
+                              login
+                            }}
+                          }}
+                        }}
+                      }}
+                    }}
+                  }}
+                }}
+              }}
+            }}
+            """
+
+            result = run_command([
+                "gh", "api", "graphql",
+                "-f", f"query={query}"
+            ])
+
+            data = json.loads(result.stdout)
+            items_data = data.get("data", {}).get("repository", {}).get(type_name)
+
+            if not items_data:
+                break
+
+            for item in items_data["nodes"]:
+                item_number = str(item["number"])
+                comments = []
+
+                for comment in item["comments"]["nodes"]:
+                    # Filter by updated_since if provided
+                    if updated_since:
+                        comment_updated = comment["updatedAt"]
+                        if comment_updated <= updated_since:
+                            continue
+
+                    comments.append(_parse_comment_node(comment))
+
+                if comments:
+                    comments_by_number[item_number] = comments
+
+                # Note: This simplified version only fetches first 100 comments per issue/PR
+                # If pagination is needed for comments, that would require individual queries
+
+            has_next_page = items_data["pageInfo"]["hasNextPage"]
+            end_cursor = items_data["pageInfo"]["endCursor"]
+
+        return comments_by_number
+
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, ValueError) as e:
+        print(f"Error getting repository comments for {repository}: {e}", file=sys.stderr)
+        return {}
+
+
 async def monitor_issue_comments(
     js,
     base_path: Path,
@@ -957,6 +1115,7 @@ async def monitor_issue_comments(
 ) -> int:
     """
     Monitor comments on active issues and publish events for new comments.
+    Uses a single query per repository to fetch all comments since the last check.
 
     Args:
         js: JetStream context
@@ -970,39 +1129,58 @@ async def monitor_issue_comments(
     new_comments_count = 0
     current_time = datetime.now(timezone.utc).isoformat()
 
+    # Group issues by repository
+    issues_by_repo: dict[str, list[str]] = {}
     for repository, issue_number in active_issues:
-        # Get the last time we checked for comments
-        last_check = get_last_comment_check(base_path, repository, issue_number, "issue")
+        if repository not in issues_by_repo:
+            issues_by_repo[repository] = []
+        issues_by_repo[repository].append(issue_number)
+
+    # Process each repository
+    for repository, issue_numbers in issues_by_repo.items():
+        # Get the earliest last check timestamp for this repository
+        last_check = get_repository_last_comment_check(base_path, repository, "issue")
 
         if last_check:
-            print(f"Checking comments on {repository}#{issue_number} since {last_check}...")
+            print(f"Checking issue comments for {repository} since {last_check}...")
         else:
-            print(f"Checking comments on {repository}#{issue_number} (first check)...")
+            print(f"Checking issue comments for {repository} (first check)...")
 
-        # Fetch comments
-        comments = get_issue_comments(repository, issue_number, last_check)
+        # Fetch all comments for the repository with a single query
+        all_comments = get_all_repository_comments(repository, "issue", last_check)
 
-        if comments:
-            print(f"  Found {len(comments)} new/updated comment(s)")
+        if all_comments:
+            total_comments = sum(len(comments) for comments in all_comments.values())
+            print(f"  Found {total_comments} new/updated comment(s) across {len(all_comments)} issue(s)")
 
-            for comment in comments:
-                event_data = {
-                    "repository": repository,
-                    "issue_number": issue_number,
-                    **comment  # Include all comment data from GraphQL
-                }
+            # Process comments for each active issue
+            for issue_number in issue_numbers:
+                comments = all_comments.get(issue_number, [])
 
-                if dry_run:
-                    print(f"    [DRY RUN] Would publish github.issue.comment.new event for comment by {comment['author']}")
-                else:
-                    await publish_event(js, "github.issue.comment.new", event_data)
-                    new_comments_count += 1
+                for comment in comments:
+                    # Check if this comment is newer than the last check for this specific issue
+                    issue_last_check = get_last_comment_check(base_path, repository, issue_number, "issue")
+                    if issue_last_check and comment["updated_at"] <= issue_last_check:
+                        continue
+
+                    event_data = {
+                        "repository": repository,
+                        "issue_number": issue_number,
+                        **comment
+                    }
+
+                    if dry_run:
+                        print(f"    [DRY RUN] Would publish github.issue.comment.new event for comment by {comment['author']} on #{issue_number}")
+                    else:
+                        await publish_event(js, "github.issue.comment.new", event_data)
+                        new_comments_count += 1
         else:
             print(f"  No new comments")
 
-        # Update the last check timestamp
+        # Update the last check timestamp for each issue
         if not dry_run:
-            save_last_comment_check(base_path, repository, issue_number, current_time, "issue")
+            for issue_number in issue_numbers:
+                save_last_comment_check(base_path, repository, issue_number, current_time, "issue")
 
     return new_comments_count
 
@@ -1015,6 +1193,7 @@ async def monitor_pr_comments(
 ) -> int:
     """
     Monitor comments on active pull requests and publish events for new comments.
+    Uses a single query per repository to fetch all comments since the last check.
 
     Args:
         js: JetStream context
@@ -1028,39 +1207,58 @@ async def monitor_pr_comments(
     new_comments_count = 0
     current_time = datetime.now(timezone.utc).isoformat()
 
+    # Group PRs by repository
+    prs_by_repo: dict[str, list[str]] = {}
     for repository, pr_number in active_prs:
-        # Get the last time we checked for comments
-        last_check = get_last_comment_check(base_path, repository, pr_number, "pr")
+        if repository not in prs_by_repo:
+            prs_by_repo[repository] = []
+        prs_by_repo[repository].append(pr_number)
+
+    # Process each repository
+    for repository, pr_numbers in prs_by_repo.items():
+        # Get the earliest last check timestamp for this repository
+        last_check = get_repository_last_comment_check(base_path, repository, "pr")
 
         if last_check:
-            print(f"Checking comments on {repository}#{pr_number} (PR) since {last_check}...")
+            print(f"Checking PR comments for {repository} since {last_check}...")
         else:
-            print(f"Checking comments on {repository}#{pr_number} (PR) (first check)...")
+            print(f"Checking PR comments for {repository} (first check)...")
 
-        # Fetch comments
-        comments = get_pr_comments(repository, pr_number, last_check)
+        # Fetch all comments for the repository with a single query
+        all_comments = get_all_repository_comments(repository, "pr", last_check)
 
-        if comments:
-            print(f"  Found {len(comments)} new/updated comment(s)")
+        if all_comments:
+            total_comments = sum(len(comments) for comments in all_comments.values())
+            print(f"  Found {total_comments} new/updated comment(s) across {len(all_comments)} PR(s)")
 
-            for comment in comments:
-                event_data = {
-                    "repository": repository,
-                    "pr_number": pr_number,
-                    **comment  # Include all comment data from GraphQL
-                }
+            # Process comments for each active PR
+            for pr_number in pr_numbers:
+                comments = all_comments.get(pr_number, [])
 
-                if dry_run:
-                    print(f"    [DRY RUN] Would publish github.pr.comment.new event for comment by {comment['author']}")
-                else:
-                    await publish_event(js, "github.pr.comment.new", event_data)
-                    new_comments_count += 1
+                for comment in comments:
+                    # Check if this comment is newer than the last check for this specific PR
+                    pr_last_check = get_last_comment_check(base_path, repository, pr_number, "pr")
+                    if pr_last_check and comment["updated_at"] <= pr_last_check:
+                        continue
+
+                    event_data = {
+                        "repository": repository,
+                        "pr_number": pr_number,
+                        **comment
+                    }
+
+                    if dry_run:
+                        print(f"    [DRY RUN] Would publish github.pr.comment.new event for comment by {comment['author']} on #{pr_number}")
+                    else:
+                        await publish_event(js, "github.pr.comment.new", event_data)
+                        new_comments_count += 1
         else:
             print(f"  No new comments")
 
-        # Update the last check timestamp
+        # Update the last check timestamp for each PR
         if not dry_run:
-            save_last_comment_check(base_path, repository, pr_number, current_time, "pr")
+            for pr_number in pr_numbers:
+                save_last_comment_check(base_path, repository, pr_number, current_time, "pr")
 
     return new_comments_count
 
@@ -1109,7 +1307,7 @@ async def main_async(args):
                 print(f"Scanning {args.path} for active issues/PRs (with .active flag)...")
             else:
                 print(f"Scanning {args.path} for all issues/PRs...")
-            all_active_items = find_active_issues(args.path, args.active_only)
+            all_active_items = find_active_issues(args.path, args.active_only, repositories)
 
             if not all_active_items:
                 print("No active issues/PRs found.")
@@ -1133,7 +1331,7 @@ async def main_async(args):
                 print(f"Scanning {args.path} for active issues/PRs (with .active flag, for comment monitoring)...")
             else:
                 print(f"Scanning {args.path} for all issues/PRs (for comment monitoring)...")
-            all_active_items = find_active_issues(args.path, args.active_only)
+            all_active_items = find_active_issues(args.path, args.active_only, repositories)
             if not all_active_items:
                 print("No active issues/PRs found.")
             else:
@@ -1173,7 +1371,8 @@ async def main_async(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Monitor GitHub issues and publish events to NATS"
+        description="Monitor GitHub issues and publish events to NATS",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
         "path",
@@ -1188,7 +1387,7 @@ def main():
     parser.add_argument(
         "--nats-server",
         default="nats://localhost:4222",
-        help="NATS server URL (default: nats://localhost:4222)"
+        help="NATS server URL"
     )
     parser.add_argument(
         "--dry-run",
@@ -1221,7 +1420,7 @@ def main():
         "--active-only",
         default=True,
         action=argparse.BooleanOptionalAction,
-        help="Only monitor issues/PRs with .active flag (default: True). Use --no-active-only to monitor all directories."
+        help="Only monitor issues/PRs with .active flag. Use --no-active-only to monitor all directories."
     )
 
     args = parser.parse_args()
