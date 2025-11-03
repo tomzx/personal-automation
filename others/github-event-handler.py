@@ -150,7 +150,7 @@ def invoke_claude(base_path: Path, repository: str, number: str | int, template_
     - BASE_DIR={base_path}
 
     If the template file is empty, skips Claude invocation (used to ignore events).
-    
+
     Args:
         base_path: Base directory path
         repository: Repository in "owner/repo" format
@@ -169,7 +169,7 @@ def invoke_claude(base_path: Path, repository: str, number: str | int, template_
 
         # Construct prompt with variables and template content
         prompt = f"REPOSITORY={repository} NUMBER={number} BASE_DIR={base_path}\n\n{template_content}"
-        cmd = ["claude", "--output-format", "stream-json", "--verbose", "-p", prompt]
+        cmd = ["claude", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--allowedTools", "SlashCommand", "-p", prompt]
 
         print(f"Calling Claude for {repository}#{number} using {template_path}...")
         print("==== claude ====")
@@ -200,6 +200,17 @@ def invoke_claude(base_path: Path, repository: str, number: str | int, template_
                     data = json.loads(line)
                     # Extract and print content from different message types
                     if data.get("type") == "system" and data.get("subtype") == "init":
+                        # Print model and permission mode
+                        model = data.get("model")
+                        if model:
+                            print(f"Model: {model}", flush=True)
+                        permission_mode = data.get("permissionMode")
+                        if permission_mode:
+                            print(f"Permission mode: {permission_mode}\n", flush=True)
+                        # Print tools at session initialization
+                        tools = data.get("tools", [])
+                        if tools:
+                            print(f"Available tools: {', '.join(tools)}\n", flush=True)
                         # Print slash commands at session initialization
                         slash_commands = data.get("slash_commands", [])
                         if slash_commands:
