@@ -64,7 +64,7 @@ def check_claude_installed() -> bool:
         return False
 
 
-def create_issue_directory(base_path: Path, repository: str, issue_number: str) -> Path:
+def create_issue_directory(base_path: Path, repository: str, number: str | int) -> Path:
     """
     Create a directory for an issue.
     The .active file should be created by the user to mark the issue as tracked.
@@ -73,17 +73,17 @@ def create_issue_directory(base_path: Path, repository: str, issue_number: str) 
     Returns:
         Path to the created issue directory
     """
-    issue_dir = base_path / repository / issue_number
+    issue_dir = base_path / repository / str(number)
     issue_dir.mkdir(parents=True, exist_ok=True)
     return issue_dir
 
 
-def remove_active_file(base_path: Path, repository: str, issue_number: str) -> bool:
+def remove_active_file(base_path: Path, repository: str, number: str | int) -> bool:
     """
     Remove the .active file from an issue directory.
     Repository format is "owner/repo" which maps to directory {base_path}/{owner}/{repo}/{issue_number}.
     """
-    issue_dir = base_path / repository / issue_number
+    issue_dir = base_path / repository / str(number)
     active_file = issue_dir / ".active"
     try:
         if active_file.exists():
@@ -140,13 +140,13 @@ def find_template(templates_dir: Path, repository: str, event_name: str) -> Path
     return None
 
 
-def invoke_claude(base_path: Path, repository: str, issue_number: str, template_path: Path) -> bool:
+def invoke_claude(base_path: Path, repository: str, number: str | int, template_path: Path) -> bool:
     """
     Invoke claude with a template.
 
     Variables injected before template content:
     - REPOSITORY={repository}
-    - NUMBER={issue_number}
+    - NUMBER={number}
     - BASE_DIR={base_path}
 
     If the template file is empty, skips Claude invocation (used to ignore events).
@@ -161,13 +161,78 @@ def invoke_claude(base_path: Path, repository: str, issue_number: str, template_
             return True
 
         # Construct prompt with variables and template content
-        prompt = f"REPOSITORY={repository} NUMBER={issue_number} BASE_DIR={base_path}\n\n{template_content}"
-        cmd = ["claude", "-p", prompt]
+        prompt = f"REPOSITORY={repository} NUMBER={number} BASE_DIR={base_path}\n\n{template_content}"
+        cmd = ["claude", "--output-format", "stream-json", "--verbose", "-p", prompt]
 
-        run_command(cmd, capture_output=False)
+        print(f"Calling Claude for {repository}#{number} using {template_path}...")
+        print("==== claude ====")
+
+        # Stream output and parse JSONL
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+
+        # Read and parse each line of JSONL output
+        last_message_id = None
+        if process.stdout:
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    # Extract and print content from different message types
+                    if data.get("type") == "system" and data.get("subtype") == "init":
+                        # Print slash commands at session initialization
+                        slash_commands = data.get("slash_commands", [])
+                        if slash_commands:
+                            print(f"Available slash commands: {', '.join(slash_commands)}\n", flush=True)
+                    elif data.get("type") == "assistant":
+                        message = data.get("message", {})
+                        message_id = message.get("id")
+
+                        # Add newline when starting a new message
+                        if last_message_id is not None and message_id != last_message_id:
+                            print()
+                        last_message_id = message_id
+
+                        content = message.get("content", [])
+                        for item in content:
+                            if isinstance(item, dict):
+                                if item.get("type") == "text":
+                                    print(item.get("text", ""), end="", flush=True)
+                                elif item.get("type") == "tool_use":
+                                    tool_name = item.get("name", "unknown")
+                                    tool_input = item.get("input", {})
+                                    print(f"\n[Tool: {tool_name}]", flush=True)
+                                    if tool_input:
+                                        print(f"Input: {json.dumps(tool_input, indent=2)}", flush=True)
+                except json.JSONDecodeError:
+                    # If line is not valid JSON, skip it
+                    pass
+
+        # Wait for process to complete
+        return_code = process.wait()
+
+        print("\n==== claude ====")
+
+        if return_code != 0:
+            stderr_output = process.stderr.read() if process.stderr else ""
+            print(f"\nError: Claude exited with code {return_code}", file=sys.stderr)
+            if stderr_output:
+                print(f"stderr: {stderr_output}", file=sys.stderr)
+            return False
+
         return True
     except subprocess.CalledProcessError as e:
-        print(f"Error invoking claude for {repository}#{issue_number}: {e}", file=sys.stderr)
+        print(f"Error invoking claude for {repository}#{number}: {e}", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"Unexpected error invoking claude for {repository}#{number}: {e}", file=sys.stderr)
         return False
 
 
@@ -184,13 +249,13 @@ class EventHandler:
         """Check if events from this user should be skipped."""
         return username in self.skip_users
 
-    def _invoke_claude_with_template(self, repository: str, issue_number: str, event_name: str, log_prefix: str) -> None:
+    def _invoke_claude_with_template(self, repository: str, number: str | int, event_name: str, log_prefix: str) -> None:
         """
         Helper method to check Claude availability, find template, and invoke Claude.
 
         Args:
             repository: Repository in "owner/repo" format
-            issue_number: Issue or PR number
+            number: Issue or PR number (can be str or int)
             event_name: Event name for template lookup
             log_prefix: Prefix for log messages (e.g., "NEW ISSUE", "UPDATE PR")
         """
@@ -204,7 +269,7 @@ class EventHandler:
             print(f"[{log_prefix}] No template found for {event_name}, skipping")
             return
 
-        if invoke_claude(self.base_path, repository, issue_number, template_path):
+        if invoke_claude(self.base_path, repository, number, template_path):
             print(f"[{log_prefix}] Successfully invoked claude")
         else:
             print(f"[{log_prefix}] Failed to invoke claude")
@@ -212,126 +277,126 @@ class EventHandler:
     async def handle_new_issue(self, data: dict) -> None:
         """Handle github.issue.new event."""
         repository = data["repository"]
-        issue_number = data["issue_number"]
+        number = data["number"]
 
         # Check if we should skip this user
         if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[NEW ISSUE] Skipping {repository}#{issue_number} from user {data['author']}")
+            print(f"[NEW ISSUE] Skipping {repository}#{number} from user {data['author']}")
             return
 
-        print(f"[NEW ISSUE] Creating directory for {repository}#{issue_number}")
-        issue_dir = create_issue_directory(self.base_path, repository, issue_number)
+        print(f"[NEW ISSUE] Creating directory for {repository}#{number}")
+        issue_dir = create_issue_directory(self.base_path, repository, number)
         print(f"[NEW ISSUE] Created directory: {issue_dir}")
 
-        self._invoke_claude_with_template(repository, issue_number, "github.issue.new", "NEW ISSUE")
+        self._invoke_claude_with_template(repository, number, "github.issue.new", "NEW ISSUE")
 
     async def handle_updated_issue(self, data: dict) -> None:
         """Handle github.issue.updated event."""
         repository = data["repository"]
-        issue_number = data["issue_number"]
+        number = data["number"]
 
         # Check if we should skip this user
         if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[UPDATE ISSUE] Skipping {repository}#{issue_number} from user {data['author']}")
+            print(f"[UPDATE ISSUE] Skipping {repository}#{number} from user {data['author']}")
             return
 
-        print(f"[UPDATE ISSUE] Processing {repository}#{issue_number}")
+        print(f"[UPDATE ISSUE] Processing {repository}#{number}")
 
-        self._invoke_claude_with_template(repository, issue_number, "github.issue.updated", "UPDATE ISSUE")
+        self._invoke_claude_with_template(repository, number, "github.issue.updated", "UPDATE ISSUE")
 
     async def handle_closed_issue(self, data: dict) -> None:
         """Handle github.issue.closed event."""
         repository = data["repository"]
-        issue_number = data["issue_number"]
+        number = data["number"]
 
         # Check if we should skip this user
         if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[CLOSE ISSUE] Skipping {repository}#{issue_number} from user {data['author']}")
+            print(f"[CLOSE ISSUE] Skipping {repository}#{number} from user {data['author']}")
             return
 
-        print(f"[CLOSE ISSUE] Marking {repository}#{issue_number} as inactive")
-        if remove_active_file(self.base_path, repository, issue_number):
-            issue_dir = self.base_path / repository / issue_number
+        print(f"[CLOSE ISSUE] Marking {repository}#{number} as inactive")
+        if remove_active_file(self.base_path, repository, number):
+            issue_dir = self.base_path / repository / str(number)
             print(f"[CLOSE ISSUE] Removed .active file from {issue_dir}")
         else:
             print(f"[CLOSE ISSUE] Failed to remove .active file")
 
-        self._invoke_claude_with_template(repository, issue_number, "github.issue.closed", "CLOSE ISSUE")
+        self._invoke_claude_with_template(repository, number, "github.issue.closed", "CLOSE ISSUE")
 
     async def handle_new_pr(self, data: dict) -> None:
         """Handle github.pr.new event."""
         repository = data["repository"]
-        pr_number = data["pr_number"]
+        number = data["number"]
 
         # Check if we should skip this user
         if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[NEW PR] Skipping {repository}#{pr_number} from user {data['author']}")
+            print(f"[NEW PR] Skipping {repository}#{number} from user {data['author']}")
             return
 
-        print(f"[NEW PR] Creating directory for {repository}#{pr_number}")
-        pr_dir = create_issue_directory(self.base_path, repository, pr_number)
+        print(f"[NEW PR] Creating directory for {repository}#{number}")
+        pr_dir = create_issue_directory(self.base_path, repository, number)
         print(f"[NEW PR] Created directory: {pr_dir}")
 
-        self._invoke_claude_with_template(repository, pr_number, "github.pr.new", "NEW PR")
+        self._invoke_claude_with_template(repository, number, "github.pr.new", "NEW PR")
 
     async def handle_updated_pr(self, data: dict) -> None:
         """Handle github.pr.updated event."""
         repository = data["repository"]
-        pr_number = data["pr_number"]
+        number = data["number"]
 
         # Check if we should skip this user
         if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[UPDATE PR] Skipping {repository}#{pr_number} from user {data['author']}")
+            print(f"[UPDATE PR] Skipping {repository}#{number} from user {data['author']}")
             return
 
-        print(f"[UPDATE PR] Processing {repository}#{pr_number}")
+        print(f"[UPDATE PR] Processing {repository}#{number}")
 
-        self._invoke_claude_with_template(repository, pr_number, "github.pr.updated", "UPDATE PR")
+        self._invoke_claude_with_template(repository, number, "github.pr.updated", "UPDATE PR")
 
     async def handle_closed_pr(self, data: dict) -> None:
         """Handle github.pr.closed event."""
         repository = data["repository"]
-        pr_number = data["pr_number"]
+        number = data["number"]
 
         # Check if we should skip this user
         if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[CLOSE PR] Skipping {repository}#{pr_number} from user {data['author']}")
+            print(f"[CLOSE PR] Skipping {repository}#{number} from user {data['author']}")
             return
 
-        print(f"[CLOSE PR] Marking {repository}#{pr_number} as inactive")
-        if remove_active_file(self.base_path, repository, pr_number):
-            pr_dir = self.base_path / repository / pr_number
+        print(f"[CLOSE PR] Marking {repository}#{number} as inactive")
+        if remove_active_file(self.base_path, repository, number):
+            pr_dir = self.base_path / repository / str(number)
             print(f"[CLOSE PR] Removed .active file from {pr_dir}")
         else:
             print(f"[CLOSE PR] Failed to remove .active file")
 
-        self._invoke_claude_with_template(repository, pr_number, "github.pr.closed", "CLOSE PR")
+        self._invoke_claude_with_template(repository, number, "github.pr.closed", "CLOSE PR")
 
     async def handle_issue_comment(self, data: dict) -> None:
         """Handle github.issue.comment.new event."""
         repository = data["repository"]
-        issue_number = data["issue_number"]
+        number = data["number"]
         comment = data["comment"]
 
-        print(f"[ISSUE COMMENT] New comment on {repository}#{issue_number}")
+        print(f"[ISSUE COMMENT] New comment on {repository}#{number}")
         print(f"[ISSUE COMMENT] Author: {comment['author']}")
         print(f"[ISSUE COMMENT] Created: {comment['created_at']}")
         print(f"[ISSUE COMMENT] URL: {comment['url']}")
 
-        self._invoke_claude_with_template(repository, issue_number, "github.issue.comment.new", "ISSUE COMMENT")
+        self._invoke_claude_with_template(repository, number, "github.issue.comment.new", "ISSUE COMMENT")
 
     async def handle_pr_comment(self, data: dict) -> None:
         """Handle github.pr.comment.new event."""
         repository = data["repository"]
-        pr_number = data["pr_number"]
+        number = data["number"]
         comment = data["comment"]
 
-        print(f"[PR COMMENT] New comment on {repository}#{pr_number}")
+        print(f"[PR COMMENT] New comment on {repository}#{number}")
         print(f"[PR COMMENT] Author: {comment['author']}")
         print(f"[PR COMMENT] Created: {comment['created_at']}")
         print(f"[PR COMMENT] URL: {comment['url']}")
 
-        self._invoke_claude_with_template(repository, pr_number, "github.pr.comment.new", "PR COMMENT")
+        self._invoke_claude_with_template(repository, number, "github.pr.comment.new", "PR COMMENT")
 
 
 async def message_handler(msg, handler: EventHandler):
