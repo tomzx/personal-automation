@@ -1288,7 +1288,7 @@ async def monitor_pr_comments(
 
                     event_data = {
                         "repository": repository,
-                        "pr_number": pr_number,
+                        "number": pr_number,
                         **comment
                     }
 
