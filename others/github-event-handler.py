@@ -31,6 +31,7 @@ from pathlib import Path
 
 try:
     from nats.aio.client import Client as NATS
+    from nats.js.api import ConsumerConfig, DeliverPolicy
     import asyncio
 except ImportError:
     print("Error: nats-py is not installed. Install it with: pip install nats-py", file=sys.stderr)
@@ -405,13 +406,46 @@ async def main_async(args):
         # Get JetStream context
         js = nc.jetstream()
 
+        # Create or get the consumer with proper configuration
+        # For new consumers, start from the beginning of the stream (DeliverPolicy.ALL)
+        print(f"Setting up consumer '{args.consumer}' on stream '{args.stream}'...")
+
+        consumer_exists = False
+        try:
+            # Check if consumer already exists
+            consumer_info = await js.consumer_info(args.stream, args.consumer)
+            consumer_exists = True
+            print(f"Consumer '{args.consumer}' already exists (pending: {consumer_info.num_pending})")
+
+            # If recreate flag is set, delete and recreate the consumer
+            if args.recreate_consumer:
+                print(f"Recreating consumer as requested...")
+                await js.delete_consumer(args.stream, args.consumer)
+                consumer_exists = False
+        except Exception:
+            # Consumer doesn't exist
+            pass
+
+        if not consumer_exists:
+            # Create consumer with DeliverPolicy.ALL
+            print(f"Creating new consumer with DeliverPolicy.ALL...")
+            from nats.js.api import ConsumerConfig
+            consumer_config = ConsumerConfig(
+                durable_name=args.consumer,
+                deliver_policy=DeliverPolicy.ALL,
+                ack_policy="explicit",
+            )
+            await js.add_consumer(args.stream, consumer_config)
+            consumer_info = await js.consumer_info(args.stream, args.consumer)
+            print(f"Created new consumer '{args.consumer}' (pending: {consumer_info.num_pending})")
+
         # Subscribe to JetStream stream with durable consumer
-        # This creates or uses an existing durable consumer
-        print(f"Creating pull subscription to stream '{args.stream}' with consumer '{args.consumer}'...")
+        print(f"Creating pull subscription...")
+
         psub = await js.pull_subscribe(
             "github.*",  # Subscribe to all GitHub events (issues, PRs, and comments)
             durable=args.consumer,
-            stream=args.stream,
+            stream=args.stream
         )
         print(f"Subscribed to stream '{args.stream}' with durable consumer '{args.consumer}'")
         print()
@@ -491,6 +525,11 @@ def main():
         nargs="*",
         default=[],
         help="List of usernames to skip event handling for"
+    )
+    parser.add_argument(
+        "--recreate-consumer",
+        action="store_true",
+        help="Delete and recreate the consumer (useful for reprocessing all messages)"
     )
 
     args = parser.parse_args()
