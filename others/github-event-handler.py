@@ -96,10 +96,73 @@ def remove_active_file(base_path: Path, repository: str, issue_number: str) -> b
         return False
 
 
-def invoke_claude(base_path: Path, repository: str, issue_number: str) -> bool:
-    """Invoke claude with the /prepare-issue command."""
+def find_template(templates_dir: Path, repository: str, event_name: str) -> Path | None:
+    """
+    Find a template file for the given event, following the hierarchy:
+    1. {owner}/{repo}/{event_name}.md
+    2. {owner}/.default/{event_name}.md
+    3. .default/{event_name}.md
+
+    If an ignore-{event_name}.md file is found, stops the hierarchy search.
+
+    Args:
+        templates_dir: Base templates directory
+        repository: Repository in "owner/repo" format
+        event_name: Event name (e.g., "github.pr.comment.new")
+
+    Returns:
+        Path to template file if found, None otherwise
+    """
+    if not templates_dir or not templates_dir.exists():
+        return None
+
+    owner, repo = repository.split("/", 1)
+    template_filename = f"{event_name}.md"
+    ignore_filename = f"ignore-{event_name}.md"
+
+    # Check in order: owner/repo -> owner/.default -> .default
+    search_paths = [
+        templates_dir / owner / repo,
+        templates_dir / owner / ".default",
+        templates_dir / ".default"
+    ]
+
+    for search_path in search_paths:
+        if not search_path.exists():
+            continue
+
+        # Check for ignore file
+        ignore_file = search_path / ignore_filename
+        if ignore_file.exists():
+            print(f"[TEMPLATE] Found {ignore_filename} in {search_path}, stopping hierarchy search")
+            return None
+
+        # Check for template file
+        template_file = search_path / template_filename
+        if template_file.exists():
+            print(f"[TEMPLATE] Found template at {template_file}")
+            return template_file
+
+    return None
+
+
+def invoke_claude(base_path: Path, repository: str, issue_number: str, template_path: Path) -> bool:
+    """
+    Invoke claude with a template.
+
+    Variables injected before template content:
+    - REPOSITORY={repository}
+    - NUMBER={issue_number}
+    - BASE_DIR={base_path}
+    """
     try:
-        cmd = ["claude", "-p", f"/prepare-issue REPOSITORY={repository} NUMBER={issue_number} BASE_DIR={base_path}"]
+        # Read template content
+        template_content = template_path.read_text(encoding="utf-8")
+
+        # Construct prompt with variables and template content
+        prompt = f"REPOSITORY={repository} NUMBER={issue_number} BASE_DIR={base_path}\n\n{template_content}"
+        cmd = ["claude", "-p", prompt]
+
         run_command(cmd, capture_output=False)
         return True
     except subprocess.CalledProcessError as e:
@@ -110,9 +173,35 @@ def invoke_claude(base_path: Path, repository: str, issue_number: str) -> bool:
 class EventHandler:
     """Handle GitHub issue and PR events."""
 
-    def __init__(self, base_path: Path, claude_available: bool = True):
+    def __init__(self, base_path: Path, claude_available: bool = True, templates_dir: Path | None = None):
         self.base_path = base_path
         self.claude_available = claude_available
+        self.templates_dir = templates_dir
+
+    def _invoke_claude_with_template(self, repository: str, issue_number: str, event_name: str, log_prefix: str) -> None:
+        """
+        Helper method to check Claude availability, find template, and invoke Claude.
+
+        Args:
+            repository: Repository in "owner/repo" format
+            issue_number: Issue or PR number
+            event_name: Event name for template lookup
+            log_prefix: Prefix for log messages (e.g., "NEW ISSUE", "UPDATE PR")
+        """
+        if not self.claude_available:
+            print(f"[{log_prefix}] Claude CLI not available, skipping invocation")
+            return
+
+        # Find template for this event
+        template_path = find_template(self.templates_dir, repository, event_name)
+        if not template_path:
+            print(f"[{log_prefix}] No template found for {event_name}, skipping")
+            return
+
+        if invoke_claude(self.base_path, repository, issue_number, template_path):
+            print(f"[{log_prefix}] Successfully invoked claude")
+        else:
+            print(f"[{log_prefix}] Failed to invoke claude")
 
     async def handle_new_issue(self, data: dict) -> None:
         """Handle github.issue.new event."""
@@ -123,6 +212,8 @@ class EventHandler:
         issue_dir = create_issue_directory(self.base_path, repository, issue_number)
         print(f"[NEW ISSUE] Created directory: {issue_dir}")
 
+        self._invoke_claude_with_template(repository, issue_number, "github.issue.new", "NEW ISSUE")
+
     async def handle_updated_issue(self, data: dict) -> None:
         """Handle github.issue.updated event."""
         repository = data["repository"]
@@ -130,14 +221,7 @@ class EventHandler:
 
         print(f"[UPDATE ISSUE] Processing {repository}#{issue_number}")
 
-        if not self.claude_available:
-            print(f"[UPDATE ISSUE] Claude CLI not available, skipping invocation")
-            return
-
-        if invoke_claude(self.base_path, repository, issue_number):
-            print(f"[UPDATE ISSUE] Successfully invoked claude")
-        else:
-            print(f"[UPDATE ISSUE] Failed to invoke claude")
+        self._invoke_claude_with_template(repository, issue_number, "github.issue.updated", "UPDATE ISSUE")
 
     async def handle_closed_issue(self, data: dict) -> None:
         """Handle github.issue.closed event."""
@@ -151,6 +235,8 @@ class EventHandler:
         else:
             print(f"[CLOSE ISSUE] Failed to remove .active file")
 
+        self._invoke_claude_with_template(repository, issue_number, "github.issue.closed", "CLOSE ISSUE")
+
     async def handle_new_pr(self, data: dict) -> None:
         """Handle github.pr.new event."""
         repository = data["repository"]
@@ -160,6 +246,8 @@ class EventHandler:
         pr_dir = create_issue_directory(self.base_path, repository, pr_number)
         print(f"[NEW PR] Created directory: {pr_dir}")
 
+        self._invoke_claude_with_template(repository, pr_number, "github.pr.new", "NEW PR")
+
     async def handle_updated_pr(self, data: dict) -> None:
         """Handle github.pr.updated event."""
         repository = data["repository"]
@@ -167,14 +255,7 @@ class EventHandler:
 
         print(f"[UPDATE PR] Processing {repository}#{pr_number}")
 
-        if not self.claude_available:
-            print(f"[UPDATE PR] Claude CLI not available, skipping invocation")
-            return
-
-        if invoke_claude(self.base_path, repository, pr_number):
-            print(f"[UPDATE PR] Successfully invoked claude")
-        else:
-            print(f"[UPDATE PR] Failed to invoke claude")
+        self._invoke_claude_with_template(repository, pr_number, "github.pr.updated", "UPDATE PR")
 
     async def handle_closed_pr(self, data: dict) -> None:
         """Handle github.pr.closed event."""
@@ -188,6 +269,8 @@ class EventHandler:
         else:
             print(f"[CLOSE PR] Failed to remove .active file")
 
+        self._invoke_claude_with_template(repository, pr_number, "github.pr.closed", "CLOSE PR")
+
     async def handle_issue_comment(self, data: dict) -> None:
         """Handle github.issue.comment.new event."""
         repository = data["repository"]
@@ -198,7 +281,8 @@ class EventHandler:
         print(f"[ISSUE COMMENT] Author: {comment['author']}")
         print(f"[ISSUE COMMENT] Created: {comment['created_at']}")
         print(f"[ISSUE COMMENT] URL: {comment['url']}")
-        # For now, just log the comment. Could add claude invocation or other actions here.
+
+        self._invoke_claude_with_template(repository, issue_number, "github.issue.comment.new", "ISSUE COMMENT")
 
     async def handle_pr_comment(self, data: dict) -> None:
         """Handle github.pr.comment.new event."""
@@ -210,7 +294,8 @@ class EventHandler:
         print(f"[PR COMMENT] Author: {comment['author']}")
         print(f"[PR COMMENT] Created: {comment['created_at']}")
         print(f"[PR COMMENT] URL: {comment['url']}")
-        # For now, just log the comment. Could add claude invocation or other actions here.
+
+        self._invoke_claude_with_template(repository, pr_number, "github.pr.comment.new", "PR COMMENT")
 
 
 async def message_handler(msg, handler: EventHandler):
@@ -266,7 +351,11 @@ async def main_async(args):
         print()
 
     # Create event handler
-    handler = EventHandler(base_path=args.path, claude_available=claude_available)
+    handler = EventHandler(
+        base_path=args.path,
+        claude_available=claude_available,
+        templates_dir=args.templates_dir
+    )
 
     # Connect to NATS
     nc = NATS()
@@ -328,6 +417,11 @@ def main():
         "path",
         type=Path,
         help="Base path containing repository/issue_number directories"
+    )
+    parser.add_argument(
+        "--templates-dir",
+        type=Path,
+        help="Templates directory containing markdown files for event handlers"
     )
     parser.add_argument(
         "--nats-server",
