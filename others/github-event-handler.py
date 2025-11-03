@@ -173,10 +173,15 @@ def invoke_claude(base_path: Path, repository: str, issue_number: str, template_
 class EventHandler:
     """Handle GitHub issue and PR events."""
 
-    def __init__(self, base_path: Path, claude_available: bool = True, templates_dir: Path | None = None):
+    def __init__(self, base_path: Path, claude_available: bool = True, templates_dir: Path | None = None, skip_users: list[str] | None = None):
         self.base_path = base_path
         self.claude_available = claude_available
         self.templates_dir = templates_dir
+        self.skip_users = set(skip_users) if skip_users else set()
+
+    def _should_skip_user(self, username: str) -> bool:
+        """Check if events from this user should be skipped."""
+        return username in self.skip_users
 
     def _invoke_claude_with_template(self, repository: str, issue_number: str, event_name: str, log_prefix: str) -> None:
         """
@@ -208,6 +213,11 @@ class EventHandler:
         repository = data["repository"]
         issue_number = data["issue_number"]
 
+        # Check if we should skip this user
+        if "author" in data and self._should_skip_user(data["author"]):
+            print(f"[NEW ISSUE] Skipping {repository}#{issue_number} from user {data['author']}")
+            return
+
         print(f"[NEW ISSUE] Creating directory for {repository}#{issue_number}")
         issue_dir = create_issue_directory(self.base_path, repository, issue_number)
         print(f"[NEW ISSUE] Created directory: {issue_dir}")
@@ -219,6 +229,11 @@ class EventHandler:
         repository = data["repository"]
         issue_number = data["issue_number"]
 
+        # Check if we should skip this user
+        if "author" in data and self._should_skip_user(data["author"]):
+            print(f"[UPDATE ISSUE] Skipping {repository}#{issue_number} from user {data['author']}")
+            return
+
         print(f"[UPDATE ISSUE] Processing {repository}#{issue_number}")
 
         self._invoke_claude_with_template(repository, issue_number, "github.issue.updated", "UPDATE ISSUE")
@@ -227,6 +242,11 @@ class EventHandler:
         """Handle github.issue.closed event."""
         repository = data["repository"]
         issue_number = data["issue_number"]
+
+        # Check if we should skip this user
+        if "author" in data and self._should_skip_user(data["author"]):
+            print(f"[CLOSE ISSUE] Skipping {repository}#{issue_number} from user {data['author']}")
+            return
 
         print(f"[CLOSE ISSUE] Marking {repository}#{issue_number} as inactive")
         if remove_active_file(self.base_path, repository, issue_number):
@@ -242,6 +262,11 @@ class EventHandler:
         repository = data["repository"]
         pr_number = data["pr_number"]
 
+        # Check if we should skip this user
+        if "author" in data and self._should_skip_user(data["author"]):
+            print(f"[NEW PR] Skipping {repository}#{pr_number} from user {data['author']}")
+            return
+
         print(f"[NEW PR] Creating directory for {repository}#{pr_number}")
         pr_dir = create_issue_directory(self.base_path, repository, pr_number)
         print(f"[NEW PR] Created directory: {pr_dir}")
@@ -253,6 +278,11 @@ class EventHandler:
         repository = data["repository"]
         pr_number = data["pr_number"]
 
+        # Check if we should skip this user
+        if "author" in data and self._should_skip_user(data["author"]):
+            print(f"[UPDATE PR] Skipping {repository}#{pr_number} from user {data['author']}")
+            return
+
         print(f"[UPDATE PR] Processing {repository}#{pr_number}")
 
         self._invoke_claude_with_template(repository, pr_number, "github.pr.updated", "UPDATE PR")
@@ -261,6 +291,11 @@ class EventHandler:
         """Handle github.pr.closed event."""
         repository = data["repository"]
         pr_number = data["pr_number"]
+
+        # Check if we should skip this user
+        if "author" in data and self._should_skip_user(data["author"]):
+            print(f"[CLOSE PR] Skipping {repository}#{pr_number} from user {data['author']}")
+            return
 
         print(f"[CLOSE PR] Marking {repository}#{pr_number} as inactive")
         if remove_active_file(self.base_path, repository, pr_number):
@@ -354,7 +389,8 @@ async def main_async(args):
     handler = EventHandler(
         base_path=args.path,
         claude_available=claude_available,
-        templates_dir=args.templates_dir
+        templates_dir=args.templates_dir,
+        skip_users=args.skip_users
     )
 
     # Connect to NATS
@@ -449,6 +485,12 @@ def main():
         type=float,
         default=5.0,
         help="Timeout in seconds for fetching messages"
+    )
+    parser.add_argument(
+        "--skip-users",
+        nargs="*",
+        default=[],
+        help="List of usernames to skip event handling for"
     )
 
     args = parser.parse_args()
