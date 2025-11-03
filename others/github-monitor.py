@@ -1436,14 +1436,21 @@ async def main_async(args):
                     else:
                         print(f"=== Cycle {cycle_count} completed in {elapsed_seconds:.2f}s. Cycle took longer than interval ({args.interval}s), starting next cycle immediately ===\n")
             except KeyboardInterrupt:
-                print("\nStopping monitoring loop...")
+                print("\n\n=== Monitoring interrupted by user ===")
+                print(f"Completed {cycle_count} monitoring cycle(s)")
+                print("Shutting down gracefully...\n")
         else:
             # Run once
             await run_monitoring_cycle(args, nc, js)
 
+    except KeyboardInterrupt:
+        print("\n\n=== Monitoring interrupted by user ===")
+        print("Shutting down gracefully...\n")
     finally:
         if not args.dry_run and nc.is_connected:
+            print("Closing NATS connection...")
             await nc.close()
+            print("NATS connection closed.")
 
     return 0
 
@@ -1522,9 +1529,14 @@ def main():
         print("Error: gh CLI is not installed. Install it from https://cli.github.com/", file=sys.stderr)
         sys.exit(1)
 
-    # Run async main
-    exit_code = asyncio.run(main_async(args))
-    sys.exit(exit_code)
+    # Run async main with proper keyboard interrupt handling
+    try:
+        exit_code = asyncio.run(main_async(args))
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        # Handle interrupt at top level (though main_async should catch it)
+        print("\n\n=== Monitoring interrupted ===", file=sys.stderr)
+        sys.exit(130)  # Standard exit code for SIGINT
 
 
 if __name__ == "__main__":
