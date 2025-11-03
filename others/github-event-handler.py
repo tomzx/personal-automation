@@ -103,7 +103,7 @@ def find_template(templates_dir: Path, repository: str, event_name: str) -> Path
     2. {owner}/.default/{event_name}.md
     3. .default/{event_name}.md
 
-    If an ignore-{event_name}.md file is found, stops the hierarchy search.
+    If an empty {event_name}.md file is found, stops the hierarchy search (used to ignore events).
 
     Args:
         templates_dir: Base templates directory
@@ -118,7 +118,6 @@ def find_template(templates_dir: Path, repository: str, event_name: str) -> Path
 
     owner, repo = repository.split("/", 1)
     template_filename = f"{event_name}.md"
-    ignore_filename = f"ignore-{event_name}.md"
 
     # Check in order: owner/repo -> owner/.default -> .default
     search_paths = [
@@ -130,12 +129,6 @@ def find_template(templates_dir: Path, repository: str, event_name: str) -> Path
     for search_path in search_paths:
         if not search_path.exists():
             continue
-
-        # Check for ignore file
-        ignore_file = search_path / ignore_filename
-        if ignore_file.exists():
-            print(f"[TEMPLATE] Found {ignore_filename} in {search_path}, stopping hierarchy search")
-            return None
 
         # Check for template file
         template_file = search_path / template_filename
@@ -154,10 +147,17 @@ def invoke_claude(base_path: Path, repository: str, issue_number: str, template_
     - REPOSITORY={repository}
     - NUMBER={issue_number}
     - BASE_DIR={base_path}
+
+    If the template file is empty, skips Claude invocation (used to ignore events).
     """
     try:
         # Read template content
         template_content = template_path.read_text(encoding="utf-8")
+
+        # Check if template is empty (used to ignore events)
+        if not template_content.strip():
+            print(f"[TEMPLATE] Template file is empty, skipping Claude invocation")
+            return True
 
         # Construct prompt with variables and template content
         prompt = f"REPOSITORY={repository} NUMBER={issue_number} BASE_DIR={base_path}\n\n{template_content}"
