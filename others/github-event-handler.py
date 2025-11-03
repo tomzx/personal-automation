@@ -140,7 +140,7 @@ def find_template(templates_dir: Path, repository: str, event_name: str) -> Path
     return None
 
 
-def invoke_claude(base_path: Path, repository: str, number: str | int, template_path: Path) -> bool:
+def invoke_claude(base_path: Path, repository: str, number: str | int, template_path: Path, claude_verbose: bool = False) -> bool:
     """
     Invoke claude with a template.
 
@@ -150,6 +150,13 @@ def invoke_claude(base_path: Path, repository: str, number: str | int, template_
     - BASE_DIR={base_path}
 
     If the template file is empty, skips Claude invocation (used to ignore events).
+    
+    Args:
+        base_path: Base directory path
+        repository: Repository in "owner/repo" format
+        number: Issue or PR number
+        template_path: Path to template file
+        claude_verbose: If True, print raw output directly to stdout instead of parsing JSONL
     """
     try:
         # Read template content
@@ -166,6 +173,12 @@ def invoke_claude(base_path: Path, repository: str, number: str | int, template_
 
         print(f"Calling Claude for {repository}#{number} using {template_path}...")
         print("==== claude ====")
+
+        # If claude_verbose is set, just print raw output directly to stdout
+        if claude_verbose:
+            result = subprocess.run(cmd, check=True)
+            print("\n==== claude ====")
+            return result.returncode == 0
 
         # Stream output and parse JSONL
         process = subprocess.Popen(
@@ -239,11 +252,12 @@ def invoke_claude(base_path: Path, repository: str, number: str | int, template_
 class EventHandler:
     """Handle GitHub issue and PR events."""
 
-    def __init__(self, base_path: Path, claude_available: bool = True, templates_dir: Path | None = None, skip_users: list[str] | None = None):
+    def __init__(self, base_path: Path, claude_available: bool = True, templates_dir: Path | None = None, skip_users: list[str] | None = None, claude_verbose: bool = False):
         self.base_path = base_path
         self.claude_available = claude_available
         self.templates_dir = templates_dir
         self.skip_users = set(skip_users) if skip_users else set()
+        self.claude_verbose = claude_verbose
 
     def _should_skip_user(self, username: str) -> bool:
         """Check if events from this user should be skipped."""
@@ -269,7 +283,7 @@ class EventHandler:
             print(f"[{log_prefix}] No template found for {event_name}, skipping")
             return
 
-        if invoke_claude(self.base_path, repository, number, template_path):
+        if invoke_claude(self.base_path, repository, number, template_path, self.claude_verbose):
             print(f"[{log_prefix}] Successfully invoked claude")
         else:
             print(f"[{log_prefix}] Failed to invoke claude")
@@ -456,7 +470,8 @@ async def main_async(args):
         base_path=args.path,
         claude_available=claude_available,
         templates_dir=args.templates_dir,
-        skip_users=args.skip_users
+        skip_users=args.skip_users,
+        claude_verbose=args.claude_verbose
     )
 
     # Connect to NATS
@@ -595,6 +610,11 @@ def main():
         "--recreate-consumer",
         action="store_true",
         help="Delete and recreate the consumer (useful for reprocessing all messages)"
+    )
+    parser.add_argument(
+        "--claude-verbose",
+        action="store_true",
+        help="Print raw Claude CLI output directly to stdout instead of parsing JSONL"
     )
 
     args = parser.parse_args()
