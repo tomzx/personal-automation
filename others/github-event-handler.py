@@ -169,7 +169,7 @@ def invoke_claude(base_path: Path, repository: str, number: str | int, template_
 
         # Construct prompt with variables and template content
         prompt = f"REPOSITORY={repository} NUMBER={number} BASE_DIR={base_path}\n\n{template_content}"
-        cmd = ["claude", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--allowedTools", "SlashCommand", "-p", prompt]
+        cmd = ["claude", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--allowed-tools", "SlashCommand", "-p", prompt]
 
         print(f"Calling Claude for {repository}#{number} using {template_path}...")
         print("==== claude ====")
@@ -424,12 +424,21 @@ class EventHandler:
         self._invoke_claude_with_template(repository, number, "github.pr.comment.new", "PR COMMENT")
 
 
-async def message_handler(msg, handler: EventHandler):
+async def message_handler(msg, handler: EventHandler, auto_confirm: bool = True):
     """Handle incoming NATS JetStream messages."""
     subject = msg.subject
     try:
         data = json.loads(msg.data.decode())
         print(f"\nReceived event on {subject}")
+        print(f"{data["repository"]}#{data["number"]} by {data["author"]}")
+        print(f"Link: {data.get("url")}")
+        title = data.get("title")
+        if title:
+            print(f"Title: {title}")
+
+        # Prompt user to continue if auto_confirm is False
+        if not auto_confirm:
+            response = input("\nPress Enter to process this event (or Ctrl+C to exit)... ")
 
         if subject == "github.issue.new":
             await handler.handle_new_issue(data)
@@ -549,7 +558,7 @@ async def main_async(args):
                 # Fetch messages in batches
                 msgs = await psub.fetch(batch=args.batch_size, timeout=args.fetch_timeout)
                 for msg in msgs:
-                    await message_handler(msg, handler)
+                    await message_handler(msg, handler, args.auto_confirm)
             except TimeoutError:
                 # No messages available, continue polling
                 continue
@@ -626,6 +635,12 @@ def main():
         "--claude-verbose",
         action="store_true",
         help="Print raw Claude CLI output directly to stdout instead of parsing JSONL"
+    )
+    parser.add_argument(
+        "--auto-confirm",
+        action="store_true",
+        default=False,
+        help="Automatically process events without confirmation. If not set, prompts after each event."
     )
 
     args = parser.parse_args()
