@@ -1,0 +1,20 @@
+#!/bin/bash
+
+# Get the script's directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN_DIR="$SCRIPT_DIR/../bin"
+NATS_BINARY="$BIN_DIR/nats-server"
+
+# Download nats-server if it doesn't exist
+if [ ! -f "$NATS_BINARY" ]; then
+    echo "nats-server not found. Downloading..."
+    cd "$BIN_DIR"
+    curl -fsSL https://binaries.nats.dev/nats-io/nats-server/v2@latest | sh
+    echo "nats-server downloaded to $BIN_DIR"
+else
+    echo "nats-server already exists at $NATS_BINARY"
+fi
+
+# Run nats-server
+echo "Starting nats-server..."
+"$NATS_BINARY" -js
