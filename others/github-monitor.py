@@ -358,13 +358,14 @@ def _fetch_paginated_items(
     return items
 
 
-def get_open_issues(repository: str, updated_since: Optional[str] = None) -> dict[str, dict]:
+def get_open_issues(repository: str, updated_since: Optional[str] = None, item_type: Optional[str] = None) -> dict[str, dict]:
     """
-    Get the list of open issues and pull requests from GitHub using GraphQL API.
+    Get the list of open issues and/or pull requests from GitHub using GraphQL API.
 
     Args:
         repository: Repository in "owner/repo" format
         updated_since: Optional ISO8601 timestamp to filter issues/PRs updated since this time
+        item_type: Optional type filter - "issue", "pr", or None for both
 
     Returns:
         Dictionary mapping issue/PR numbers (as strings) to data dictionaries.
@@ -378,31 +379,33 @@ def get_open_issues(repository: str, updated_since: Optional[str] = None) -> dic
         if updated_since:
             filter_clause = f', filterBy: {{since: "{updated_since}"}}'
 
-        # Create query builders with the specific parameters
-        def issue_query_builder(cursor):
-            return _build_issue_query(owner, repo, filter_clause, cursor)
+        items = {}
 
-        def pr_query_builder(cursor):
-            return _build_pr_query(owner, repo, filter_clause, cursor)
+        # Fetch issues if requested
+        if item_type is None or item_type == "issue":
+            def issue_query_builder(cursor):
+                return _build_issue_query(owner, repo, filter_clause, cursor)
 
-        # Fetch issues
-        items = _fetch_paginated_items(
-            repository,
-            issue_query_builder,
-            ["repository", "issues"],
-            _parse_issue_node
-        )
+            issue_items = _fetch_paginated_items(
+                repository,
+                issue_query_builder,
+                ["repository", "issues"],
+                _parse_issue_node
+            )
+            items.update(issue_items)
 
-        # Fetch pull requests
-        pr_items = _fetch_paginated_items(
-            repository,
-            pr_query_builder,
-            ["repository", "pullRequests"],
-            _parse_pr_node
-        )
+        # Fetch pull requests if requested
+        if item_type is None or item_type == "pr":
+            def pr_query_builder(cursor):
+                return _build_pr_query(owner, repo, filter_clause, cursor)
 
-        # Merge PRs into items
-        items.update(pr_items)
+            pr_items = _fetch_paginated_items(
+                repository,
+                pr_query_builder,
+                ["repository", "pullRequests"],
+                _parse_pr_node
+            )
+            items.update(pr_items)
 
         return items
     except (ValueError) as e:
@@ -839,10 +842,11 @@ async def monitor_repositories(
     base_path: Path,
     repositories: list[str],
     dry_run: bool = False,
-    updated_since: Optional[str] = None
+    updated_since: Optional[str] = None,
+    item_type: Optional[str] = None
 ) -> int:
     """
-    Monitor repositories and publish events for new open issues and PRs.
+    Monitor repositories and publish events for new open issues and/or PRs.
 
     Args:
         js: JetStream context
@@ -850,6 +854,7 @@ async def monitor_repositories(
         repositories: List of repositories to monitor
         dry_run: If True, don't publish events
         updated_since: Optional ISO8601 timestamp to filter issues/PRs updated since this time
+        item_type: Optional type filter - "issue", "pr", or None for both
 
     Returns:
         Number of new issues/PRs discovered
@@ -857,26 +862,28 @@ async def monitor_repositories(
     new_issues_count = 0
     current_time = datetime.now(timezone.utc).isoformat()
 
+    type_label = "issues/PRs" if item_type is None else ("issues" if item_type == "issue" else "PRs")
+
     for repository in repositories:
         if updated_since:
-            print(f"Fetching open issues for {repository} updated since {updated_since}...")
+            print(f"Fetching open {type_label} for {repository} updated since {updated_since}...")
         else:
-            print(f"Fetching open issues for {repository}...")
+            print(f"Fetching open {type_label} for {repository}...")
 
-        open_items = get_open_issues(repository, updated_since)
+        open_items = get_open_issues(repository, updated_since, item_type)
 
         if not open_items:
-            print(f"  No open issues/PRs found or error fetching")
+            print(f"  No open {type_label} found or error fetching")
             continue
 
-        print(f"  Found {len(open_items)} open issue(s)/PR(s)")
+        print(f"  Found {len(open_items)} open {type_label}")
 
         for number, item_data in open_items.items():
             item_dir = base_path / repository / number
-            item_type = item_data.get("type", "issue")
+            item_type_from_data = item_data.get("type", "issue")
 
             if not item_dir.exists():
-                if item_type == "pr":
+                if item_type_from_data == "pr":
                     print(f"    New PR discovered: {repository}#{number}")
                     event_subject = "github.pr.new"
                 else:
@@ -891,11 +898,11 @@ async def monitor_repositories(
                 if dry_run:
                     print(f"    [DRY RUN] Would publish {event_subject} event")
                     print(f"    [DRY RUN] Would save .last_checked timestamp")
-                    print(f"    [DRY RUN] Would save .type file as '{item_type}'")
+                    print(f"    [DRY RUN] Would save .type file as '{item_type_from_data}'")
                 else:
                     await publish_event(js, event_subject, event_data)
                     save_last_checked(base_path, repository, number, current_time)
-                    save_type_to_file(base_path, repository, number, item_type)
+                    save_type_to_file(base_path, repository, number, item_type_from_data)
                     new_issues_count += 1
 
         print()
@@ -907,9 +914,10 @@ async def process_active_issues(
     js,
     base_path: Path,
     active_issues: list[tuple[str, str]],
-    dry_run: bool = False
+    dry_run: bool = False,
+    item_type: Optional[str] = None
 ) -> None:
-    """Process all active issues and PRs and publish appropriate events."""
+    """Process all active issues and/or PRs and publish appropriate events."""
     current_time = datetime.now(timezone.utc).isoformat()
 
     # Group issues by repository
@@ -919,10 +927,12 @@ async def process_active_issues(
             issues_by_repo[repository] = []
         issues_by_repo[repository].append(issue_number)
 
+    type_label = "issues/PRs" if item_type is None else ("issues" if item_type == "issue" else "PRs")
+
     # Process each repository
     for repository, issue_numbers in issues_by_repo.items():
-        print(f"Checking open issues/PRs for {repository}...")
-        open_items = get_open_issues(repository)
+        print(f"Checking open {type_label} for {repository}...")
+        open_items = get_open_issues(repository, item_type=item_type)
 
         if not open_items and len(issue_numbers) > 0:
             print(f"  Warning: Could not fetch open issues/PRs for {repository}")
@@ -934,7 +944,7 @@ async def process_active_issues(
 
             if number in open_items:
                 item_data = open_items[number]
-                item_type = item_data.get("type", "issue")
+                item_type_from_data = item_data.get("type", "issue")
 
                 # Get the last check timestamp
                 last_check = get_last_checked(base_path, repository, number)
@@ -949,7 +959,7 @@ async def process_active_issues(
                     **item_data  # Include all item data from GraphQL
                 }
 
-                if item_type == "pr":
+                if item_type_from_data == "pr":
                     if has_update:
                         print(f"    PR has been updated, emitting update event")
                         event_subject = "github.pr.updated"
@@ -1322,18 +1332,28 @@ async def run_monitoring_cycle(args, nc, js):
 
     print(f"Tracking repositories: {', '.join(repositories)}\n")
 
-    # Monitor repositories and publish events for new issues/PRs (if enabled)
+    # Monitor repositories and publish events for new issues (if enabled)
     if args.monitor_issues:
         new_count = await monitor_repositories(
-            js, args.path, repositories, args.dry_run, args.updated_since
+            js, args.path, repositories, args.dry_run, args.updated_since, item_type="issue"
         )
         if new_count > 0:
-            print(f"Discovered {new_count} new issue(s)/PR(s)\n")
+            print(f"Discovered {new_count} new issue(s)\n")
 
-    # Find all active issues/PRs (if issue monitoring is enabled)
+    # Monitor repositories and publish events for new PRs (if enabled)
+    if args.monitor_prs:
+        new_count = await monitor_repositories(
+            js, args.path, repositories, args.dry_run, args.updated_since, item_type="pr"
+        )
+        if new_count > 0:
+            print(f"Discovered {new_count} new PR(s)\n")
+
+    # Find all active issues/PRs (if monitoring or comment monitoring is enabled)
     active_issues = []
     active_prs = []
-    if args.monitor_issues:
+    need_to_scan = (args.monitor_issues or args.monitor_prs or args.monitor_issue_comments or args.monitor_pr_comments)
+
+    if need_to_scan:
         if args.active_only:
             print(f"Scanning {args.path} for active issues/PRs (with .active flag)...")
         else:
@@ -1353,27 +1373,13 @@ async def run_monitoring_cycle(args, nc, js):
 
             print(f"Found {len(active_issues)} active issue(s) and {len(active_prs)} active PR(s)\n")
 
-            # Process active issues/PRs and publish events
-            await process_active_issues(js, args.path, all_active_items, args.dry_run)
-    elif args.monitor_issue_comments or args.monitor_pr_comments:
-        # If comment monitoring is enabled but issue monitoring is not,
-        # still need to find active issues/PRs for comment checking
-        if args.active_only:
-            print(f"Scanning {args.path} for active issues/PRs (with .active flag, for comment monitoring)...")
-        else:
-            print(f"Scanning {args.path} for all issues/PRs (for comment monitoring)...")
-        all_active_items = find_active_issues(args.path, args.active_only, repositories)
-        if not all_active_items:
-            print("No active issues/PRs found.")
-        else:
-            # Separate issues from PRs
-            for repository, number in all_active_items:
-                if is_pull_request(repository, number, args.path):
-                    active_prs.append((repository, number))
-                else:
-                    active_issues.append((repository, number))
+            # Process active issues (if monitoring enabled)
+            if args.monitor_issues and active_issues:
+                await process_active_issues(js, args.path, active_issues, args.dry_run, item_type="issue")
 
-            print(f"Found {len(active_issues)} active issue(s) and {len(active_prs)} active PR(s)\n")
+            # Process active PRs (if monitoring enabled)
+            if args.monitor_prs and active_prs:
+                await process_active_issues(js, args.path, active_prs, args.dry_run, item_type="pr")
 
     # Monitor issue comments if enabled
     if args.monitor_issue_comments and active_issues:
@@ -1488,7 +1494,13 @@ def main():
         "--monitor-issues",
         default=True,
         action=argparse.BooleanOptionalAction,
-        help="Monitor and publish events for issues and PRs (new, updated, closed)"
+        help="Monitor and publish events for issues (new, updated, closed)"
+    )
+    parser.add_argument(
+        "--monitor-prs",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Monitor and publish events for pull requests (new, updated, closed)"
     )
     parser.add_argument(
         "--monitor-issue-comments",
