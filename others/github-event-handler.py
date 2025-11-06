@@ -28,6 +28,8 @@ import json
 import re
 import subprocess
 import sys
+import termios
+import tty
 from pathlib import Path
 
 try:
@@ -37,6 +39,18 @@ try:
 except ImportError:
     print("Error: nats-py is not installed. Install it with: pip install nats-py", file=sys.stderr)
     sys.exit(1)
+
+
+def getch() -> str:
+    """Read a single character from stdin without requiring Enter."""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
 
 
 def run_command(cmd: list[str], capture_output: bool = True) -> subprocess.CompletedProcess:
@@ -438,7 +452,24 @@ async def message_handler(msg, handler: EventHandler, auto_confirm: bool = True,
 
         # Prompt user to continue if auto_confirm is False
         if not auto_confirm:
-            response = input("\nPress Enter to process this event (or Ctrl+C to exit)... ")
+            while True:
+                print("\nPress Enter to process this event, 's' to skip (or Ctrl+C to exit)... ", end='', flush=True)
+                response = getch()
+                # Handle Ctrl+C (^C)
+                if response == '\x03':
+                    print()
+                    raise KeyboardInterrupt
+                elif response.lower() == 's':
+                    print('s')
+                    print(f"Skipping {repository}#{number}")
+                    await msg.ack()
+                    return
+                elif response == '\r' or response == '\n':
+                    print()  # Newline after Enter
+                    break  # Valid key, proceed with processing
+                else:
+                    print()  # Newline for any other character
+                    print(f"Unknown key. Please press Enter to process, 's' to skip, or Ctrl+C to exit.")
 
         if subject == "github.issue.new":
             await handler.handle_new_issue(data)
