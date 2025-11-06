@@ -25,6 +25,7 @@ Directory structure: {base_path}/{owner}/{repo}/{issue_or_pr_number}/
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -260,19 +261,32 @@ def invoke_claude(base_path: Path, repository: str, number: str | int, template_
         return False
 
 
+def should_process_repository(repository: str, repository_pattern: re.Pattern | None) -> bool:
+    """Check if events for this repository should be processed."""
+    # If no pattern specified, process all repositories
+    if repository_pattern is None:
+        return True
+    # Check if repository matches the pattern
+    return repository_pattern.search(repository) is not None
+
+
+def should_process_user(username: str, skip_user_pattern: re.Pattern | None) -> bool:
+    """Check if events from this user should be processed."""
+    # If no pattern specified, process all users
+    if skip_user_pattern is None:
+        return True
+    # If pattern matches, don't process (skip)
+    return skip_user_pattern.search(username) is None
+
+
 class EventHandler:
     """Handle GitHub issue and PR events."""
 
-    def __init__(self, base_path: Path, claude_available: bool = True, templates_dir: Path | None = None, skip_users: list[str] | None = None, claude_verbose: bool = False):
+    def __init__(self, base_path: Path, claude_available: bool = True, templates_dir: Path | None = None, claude_verbose: bool = False):
         self.base_path = base_path
         self.claude_available = claude_available
         self.templates_dir = templates_dir
-        self.skip_users = set(skip_users) if skip_users else set()
         self.claude_verbose = claude_verbose
-
-    def _should_skip_user(self, username: str) -> bool:
-        """Check if events from this user should be skipped."""
-        return username in self.skip_users
 
     def _invoke_claude_with_template(self, repository: str, number: str | int, event_name: str, log_prefix: str) -> None:
         """
@@ -304,11 +318,6 @@ class EventHandler:
         repository = data["repository"]
         number = data["number"]
 
-        # Check if we should skip this user
-        if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[NEW ISSUE] Skipping {repository}#{number} from user {data['author']}")
-            return
-
         print(f"[NEW ISSUE] Creating directory for {repository}#{number}")
         issue_dir = create_issue_directory(self.base_path, repository, number)
         print(f"[NEW ISSUE] Created directory: {issue_dir}")
@@ -320,11 +329,6 @@ class EventHandler:
         repository = data["repository"]
         number = data["number"]
 
-        # Check if we should skip this user
-        if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[UPDATE ISSUE] Skipping {repository}#{number} from user {data['author']}")
-            return
-
         print(f"[UPDATE ISSUE] Processing {repository}#{number}")
 
         self._invoke_claude_with_template(repository, number, "github.issue.updated", "UPDATE ISSUE")
@@ -333,11 +337,6 @@ class EventHandler:
         """Handle github.issue.closed event."""
         repository = data["repository"]
         number = data["number"]
-
-        # Check if we should skip this user
-        if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[CLOSE ISSUE] Skipping {repository}#{number} from user {data['author']}")
-            return
 
         print(f"[CLOSE ISSUE] Marking {repository}#{number} as inactive")
         if remove_active_file(self.base_path, repository, number):
@@ -353,11 +352,6 @@ class EventHandler:
         repository = data["repository"]
         number = data["number"]
 
-        # Check if we should skip this user
-        if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[NEW PR] Skipping {repository}#{number} from user {data['author']}")
-            return
-
         print(f"[NEW PR] Creating directory for {repository}#{number}")
         pr_dir = create_issue_directory(self.base_path, repository, number)
         print(f"[NEW PR] Created directory: {pr_dir}")
@@ -369,11 +363,6 @@ class EventHandler:
         repository = data["repository"]
         number = data["number"]
 
-        # Check if we should skip this user
-        if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[UPDATE PR] Skipping {repository}#{number} from user {data['author']}")
-            return
-
         print(f"[UPDATE PR] Processing {repository}#{number}")
 
         self._invoke_claude_with_template(repository, number, "github.pr.updated", "UPDATE PR")
@@ -382,11 +371,6 @@ class EventHandler:
         """Handle github.pr.closed event."""
         repository = data["repository"]
         number = data["number"]
-
-        # Check if we should skip this user
-        if "author" in data and self._should_skip_user(data["author"]):
-            print(f"[CLOSE PR] Skipping {repository}#{number} from user {data['author']}")
-            return
 
         print(f"[CLOSE PR] Marking {repository}#{number} as inactive")
         if remove_active_file(self.base_path, repository, number):
@@ -424,17 +408,33 @@ class EventHandler:
         self._invoke_claude_with_template(repository, number, "github.pr.comment.new", "PR COMMENT")
 
 
-async def message_handler(msg, handler: EventHandler, auto_confirm: bool = True):
+async def message_handler(msg, handler: EventHandler, auto_confirm: bool = True, repository_pattern: re.Pattern | None = None, skip_user_pattern: re.Pattern | None = None):
     """Handle incoming NATS JetStream messages."""
     subject = msg.subject
     try:
         data = json.loads(msg.data.decode())
+        repository = data["repository"]
+        number = data["number"]
+        author = data.get("author")
+
         print(f"\nReceived event on {subject}")
-        print(f"{data["repository"]}#{data["number"]} by {data["author"]}")
+        print(f"{repository}#{number} by {author}")
         print(f"Link: {data.get("url")}")
         title = data.get("title")
         if title:
             print(f"Title: {title}")
+
+        # Check if we should process this repository
+        if not should_process_repository(repository, repository_pattern):
+            print(f"Skipping {repository}#{number} (repository not in filter)")
+            await msg.ack()
+            return
+
+        # Check if we should process this user (for non-comment events)
+        if not should_process_user(author, skip_user_pattern):
+            print(f"Skipping {repository}#{number} from user {author}")
+            await msg.ack()
+            return
 
         # Prompt user to continue if auto_confirm is False
         if not auto_confirm:
@@ -485,12 +485,20 @@ async def main_async(args):
         print("Install from: https://github.com/anthropics/anthropic-quickstarts", file=sys.stderr)
         print()
 
+    # Compile regex patterns if provided
+    repository_pattern = None
+    if args.repositories:
+        repository_pattern = re.compile(args.repositories)
+
+    skip_user_pattern = None
+    if args.skip_users:
+        skip_user_pattern = re.compile(args.skip_users)
+
     # Create event handler
     handler = EventHandler(
         base_path=args.path,
         claude_available=claude_available,
         templates_dir=args.templates_dir,
-        skip_users=args.skip_users,
         claude_verbose=args.claude_verbose
     )
 
@@ -558,7 +566,7 @@ async def main_async(args):
                 # Fetch messages in batches
                 msgs = await psub.fetch(batch=args.batch_size, timeout=args.fetch_timeout)
                 for msg in msgs:
-                    await message_handler(msg, handler, args.auto_confirm)
+                    await message_handler(msg, handler, args.auto_confirm, repository_pattern, skip_user_pattern)
             except TimeoutError:
                 # No messages available, continue polling
                 continue
@@ -622,9 +630,9 @@ def main():
     )
     parser.add_argument(
         "--skip-users",
-        nargs="*",
-        default=[],
-        help="List of usernames to skip event handling for"
+        type=str,
+        default=None,
+        help="Regex pattern to skip event handling for matching usernames. If not specified, processes events from all users."
     )
     parser.add_argument(
         "--recreate-consumer",
@@ -641,6 +649,12 @@ def main():
         action="store_true",
         default=False,
         help="Automatically process events without confirmation. If not set, prompts after each event."
+    )
+    parser.add_argument(
+        "--repositories",
+        type=str,
+        default=None,
+        help="Regex pattern to filter repositories. If not specified, processes all repositories. Repository format is 'owner/repo'."
     )
 
     args = parser.parse_args()
