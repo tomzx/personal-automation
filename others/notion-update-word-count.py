@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # /// script
 # dependencies = [
-#   "notion-client>=2.0.0,<3",
-#   "python-dotenv>=1.0.0,<2",
+#   "notion-client>=2.7.0,<3",
+#   "python-dotenv>=1.2.0,<2",
 # ]
 # ///
 """
