@@ -28,14 +28,12 @@ fi
 # Organizations parameter or environment variable
 ORGS="${4:-${GITHUB_ORGS}}"
 if [ -n "$ORGS" ]; then
-    # Convert comma-separated list to space-separated org: qualifiers
-    ORG_FILTER=$(echo "$ORGS" | tr ',' '\n' | sed 's/^/org:/' | tr '\n' ' ')
     ORG_DISPLAY=" (Organizations: $ORGS)"
+    OWNER_FLAG="--owner=$ORGS"
 else
-    ORG_FILTER=""
     ORG_DISPLAY=" (All organizations)"
+    OWNER_FLAG=""
 fi
-
 echo "Fetching GitHub activity for user: $USER$ORG_DISPLAY"
 echo "Date range: $START_DATE to $END_DATE"
 echo "================================================"
@@ -46,7 +44,7 @@ echo "Fetching data..."
 echo ""
 
 # Search for commits (background)
-gh search commits --author="$USER" $ORG_FILTER --author-date="$START_DATE..$END_DATE" --limit 100 --json repository,commit,author,committer --jq '
+gh search commits --author="$USER" $OWNER_FLAG --author-date="$START_DATE..$END_DATE" --limit 100 --json repository,commit,author,committer --jq '
   group_by(.repository.owner.login + "/" + .repository.name) |
   .[] |
   "  [\(.[0].repository.owner.login)/\(.[0].repository.name)]" + "\n" +
@@ -55,23 +53,23 @@ gh search commits --author="$USER" $ORG_FILTER --author-date="$START_DATE..$END_
 PID_COMMITS=$!
 
 # Search for pull requests created (background)
-gh search prs --author="$USER" $ORG_FILTER --created="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_prs_$$.txt 2>/dev/null &
+gh search prs --author="$USER" $OWNER_FLAG --created="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_prs_$$.txt 2>/dev/null &
 PID_PRS=$!
 
 # Search for pull requests reviewed (background)
-gh search prs --reviewed-by="$USER" $ORG_FILTER --updated="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_pr_reviews_$$.txt 2>/dev/null &
+gh search prs --reviewed-by="$USER" $OWNER_FLAG --updated="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_pr_reviews_$$.txt 2>/dev/null &
 PID_PR_REVIEWS=$!
 
 # Search for pull requests merged (background)
-gh search prs --author="$USER" $ORG_FILTER --merged-at="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,closedAt --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (merged: \(.closedAt | sub("T"; " ") | sub("Z"; ""))) - \(.url)"' > /tmp/gh_prs_merged_$$.txt 2>/dev/null &
+gh search prs --author="$USER" $OWNER_FLAG --merged-at="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,closedAt --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (merged: \(.closedAt | sub("T"; " ") | sub("Z"; ""))) - \(.url)"' > /tmp/gh_prs_merged_$$.txt 2>/dev/null &
 PID_PRS_MERGED=$!
 
 # Search for issues created (background)
-gh search issues --author="$USER" $ORG_FILTER --created="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_issues_$$.txt 2>/dev/null &
+gh search issues --author="$USER" $OWNER_FLAG --created="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_issues_$$.txt 2>/dev/null &
 PID_ISSUES=$!
 
 # Search for issues commented on (background)
-gh search issues --commenter="$USER" $ORG_FILTER --updated="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_comments_$$.txt 2>/dev/null &
+gh search issues --commenter="$USER" $OWNER_FLAG --updated="$START_DATE..$END_DATE" --limit 100 --json repository,title,number,url,state --jq '.[] | "  - [\(.repository.nameWithOwner)#\(.number)] \(.title) (\(.state)) - \(.url)"' > /tmp/gh_comments_$$.txt 2>/dev/null &
 PID_COMMENTS=$!
 
 # Wait for all background jobs to complete
