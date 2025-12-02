@@ -1,0 +1,65 @@
+#!/bin/bash
+# Set up Cursor to reuse Claude configurations
+# Creates symlinks:
+# - CLAUDE.md -> AGENTS.md
+# - .claude/commands/ -> .cursor/rules/
+
+set -e
+
+CLAUDE_MD=".claude/CLAUDE.md"
+AGENTS_MD=".cursor/AGENTS.md"
+CLAUDE_COMMANDS=".claude/commands"
+CURSOR_RULES=".cursor/rules"
+
+echo "Setting up Cursor to reuse Claude configurations..."
+echo
+
+# Create .cursor directory if it doesn't exist
+mkdir -p ".cursor"
+
+# Symlink CLAUDE.md to AGENTS.md
+if [ ! -e "$CLAUDE_MD" ]; then
+    echo "❌ Source does not exist: $CLAUDE_MD"
+    exit 1
+fi
+
+if [ -L "$AGENTS_MD" ]; then
+    echo "ℹ️  Symlink already exists: $AGENTS_MD -> $(readlink "$AGENTS_MD")"
+elif [ -e "$AGENTS_MD" ]; then
+    echo "⚠️  Target already exists and is not a symlink: $AGENTS_MD"
+    read -p "Remove and create symlink? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rm -rf "$AGENTS_MD"
+        ln -s "$CLAUDE_MD" "$AGENTS_MD"
+        echo "✅ Created symlink: $AGENTS_MD -> $CLAUDE_MD"
+    fi
+else
+    ln -s "$CLAUDE_MD" "$AGENTS_MD"
+    echo "✅ Created symlink: $AGENTS_MD -> $CLAUDE_MD"
+fi
+
+# Symlink .claude/commands/ to .cursor/rules/
+if [ ! -e "$CLAUDE_COMMANDS" ]; then
+    echo "❌ Source does not exist: $CLAUDE_COMMANDS"
+    exit 1
+fi
+
+if [ -L "$CURSOR_RULES" ]; then
+    echo "ℹ️  Symlink already exists: $CURSOR_RULES -> $(readlink "$CURSOR_RULES")"
+elif [ -e "$CURSOR_RULES" ]; then
+    echo "⚠️  Target already exists and is not a symlink: $CURSOR_RULES"
+    read -p "Remove and create symlink? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rm -rf "$CURSOR_RULES"
+        ln -s "$CLAUDE_COMMANDS" "$CURSOR_RULES"
+        echo "✅ Created symlink: $CURSOR_RULES -> $CLAUDE_COMMANDS"
+    fi
+else
+    ln -s "$CLAUDE_COMMANDS" "$CURSOR_RULES"
+    echo "✅ Created symlink: $CURSOR_RULES -> $CLAUDE_COMMANDS"
+fi
+
+echo
+echo "✅ Setup complete!"
