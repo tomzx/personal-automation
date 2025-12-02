@@ -25,6 +25,20 @@ except ImportError:
     sys.exit(1)
 
 
+def expand_path(path):
+    """Expand path by resolving tilde, environment variables, and converting to absolute path."""
+    # Expand tilde (~) to home directory
+    path = os.path.expanduser(path)
+
+    # Expand environment variables ($VAR or ${VAR})
+    path = os.path.expandvars(path)
+
+    # Convert to absolute path
+    path = os.path.abspath(path)
+
+    return path
+
+
 def create_filepath(path_template, screen_num, image_format):
     """Create full file path from template with variable substitution."""
     now = datetime.now()
@@ -141,6 +155,9 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Expand path (tilde, env vars, resolve to absolute)
+    args.path = expand_path(args.path)
 
     # Validate arguments
     if args.interval <= 0:

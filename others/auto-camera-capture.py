@@ -27,12 +27,18 @@ def get_current_datetime():
 
 
 def format_path(path_template, image_format):
-    """Format the path template with current date/time and format"""
+    """Format the path template with current date/time and format, expanding ~ and resolving paths"""
     variables = get_current_datetime()
     variables['format'] = image_format
 
     try:
         formatted_path = path_template.format(**variables)
+        # Expand ~ to home directory
+        formatted_path = os.path.expanduser(formatted_path)
+        # Expand environment variables ($VAR or ${VAR})
+        formatted_path = os.path.expandvars(formatted_path)
+        # Resolve to absolute path
+        formatted_path = os.path.abspath(formatted_path)
         return formatted_path
     except KeyError as e:
         print(f"Error: Unknown variable in path template: {e}")

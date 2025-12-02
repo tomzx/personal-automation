@@ -1,0 +1,10 @@
+- name: Auto Screenshot
+  command: uv run ~/repos/git/personal-automation/others/auto-screenshot.py "~/screenshots/{date}/{screen}/{date}-{time}.{format}" --format jpeg --interval 60
+- name: Auto Camera Capture
+  command: uv run ~/repos/git/personal-automation/others/auto-camera-capture.py "~/snapshots/{date}/{date}-{time}.{format}" --format jpeg --device "HD Pro Webcam C920"
+- name: NATS
+  command: others/run-nats
+- name: GitHub Monitor
+  command: cd ~/repos/git/github-monitor && uv run github-monitor monitor ~/repos/git/shopify-personal-notes/issues --interval 1m
+- name: GitHub Event Handler
+  command: cd ~/repos/git/github-event-handler && uv run github-monitor event-handler ~/repos/git/shopify-personal-notes/issues --templates-dir ~/repos/git/github-event-handler-templates --skip-users tomzx
