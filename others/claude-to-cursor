@@ -2,14 +2,17 @@
 # Set up Cursor to reuse Claude configurations
 # Creates symlinks:
 # - CLAUDE.md -> AGENTS.md
-# - .claude/commands/ -> .cursor/rules/
+# - .claude/commands/ -> .cursor/commands/
+# - .claude/skills/ -> .cursor/skills/
 
 set -e
 
 CLAUDE_MD=".claude/CLAUDE.md"
 AGENTS_MD=".cursor/AGENTS.md"
 CLAUDE_COMMANDS=".claude/commands"
-CURSOR_RULES=".cursor/rules"
+CURSOR_COMMANDS=".cursor/commands"
+CLAUDE_SKILLS=".claude/skills"
+CURSOR_SKILLS=".cursor/skills"
 
 echo "Setting up Cursor to reuse Claude configurations..."
 echo
@@ -45,20 +48,42 @@ if [ ! -e "$CLAUDE_COMMANDS" ]; then
     exit 1
 fi
 
-if [ -L "$CURSOR_RULES" ]; then
-    echo "ℹ️  Symlink already exists: $CURSOR_RULES -> $(readlink "$CURSOR_RULES")"
-elif [ -e "$CURSOR_RULES" ]; then
-    echo "⚠️  Target already exists and is not a symlink: $CURSOR_RULES"
+if [ -L "$CURSOR_COMMANDS" ]; then
+    echo "ℹ️  Symlink already exists: $CURSOR_COMMANDS -> $(readlink "$CURSOR_COMMANDS")"
+elif [ -e "$CURSOR_COMMANDS" ]; then
+    echo "⚠️  Target already exists and is not a symlink: $CURSOR_COMMANDS"
     read -p "Remove and create symlink? (y/N): " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        rm -rf "$CURSOR_RULES"
-        ln -s "$CLAUDE_COMMANDS" "$CURSOR_RULES"
-        echo "✅ Created symlink: $CURSOR_RULES -> $CLAUDE_COMMANDS"
+        rm -rf "$CURSOR_COMMANDS"
+        ln -s "$CLAUDE_COMMANDS" "$CURSOR_COMMANDS"
+        echo "✅ Created symlink: $CURSOR_COMMANDS -> $CLAUDE_COMMANDS"
     fi
 else
-    ln -s "$CLAUDE_COMMANDS" "$CURSOR_RULES"
-    echo "✅ Created symlink: $CURSOR_RULES -> $CLAUDE_COMMANDS"
+    ln -s "$CLAUDE_COMMANDS" "$CURSOR_COMMANDS"
+    echo "✅ Created symlink: $CURSOR_COMMANDS -> $CLAUDE_COMMANDS"
+fi
+
+# Symlink .claude/skills/ to .cursor/skills/
+if [ ! -e "$CLAUDE_SKILLS" ]; then
+    echo "❌ Source does not exist: $CLAUDE_SKILLS"
+    exit 1
+fi
+
+if [ -L "$CURSOR_SKILLS" ]; then
+    echo "ℹ️  Symlink already exists: $CURSOR_SKILLS -> $(readlink "$CURSOR_SKILLS")"
+elif [ -e "$CURSOR_SKILLS" ]; then
+    echo "⚠️  Target already exists and is not a symlink: $CURSOR_SKILLS"
+    read -p "Remove and create symlink? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        rm -rf "$CURSOR_SKILLS"
+        ln -s "$CLAUDE_SKILLS" "$CURSOR_SKILLS"
+        echo "✅ Created symlink: $CURSOR_SKILLS -> $CLAUDE_SKILLS"
+    fi
+else
+    ln -s "$CLAUDE_SKILLS" "$CURSOR_SKILLS"
+    echo "✅ Created symlink: $CURSOR_SKILLS -> $CLAUDE_SKILLS"
 fi
 
 echo
