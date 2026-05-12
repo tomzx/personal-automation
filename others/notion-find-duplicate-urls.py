@@ -684,6 +684,11 @@ def main():
         help="Path to .env file (optional)"
     )
     parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip confirmation prompt when deduplicating"
+    )
+    parser.add_argument(
         "--list-data-sources",
         action="store_true",
         help="List all available data sources and exit"
@@ -715,7 +720,7 @@ def main():
         print("Set it via --data-source-id argument or NOTION_DATA_SOURCE_ID environment variable", file=sys.stderr)
         sys.exit(1)
 
-    if args.deduplicate and not args.dry_run:
+    if args.deduplicate and not args.dry_run and not args.yes:
         response = input("This will permanently delete duplicate entries. Continue? (yes/no): ")
         if response.lower() != "yes":
             print("Aborted.")
