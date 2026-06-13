@@ -166,10 +166,10 @@ async function resolveProperties(
 
 interface ScanOptions {
 	dataSourceId: string;
-	urlProperty?: string;
-	readTimeProperty?: string;
-	ratingProperty?: string;
-	includeEmpty?: boolean;
+	urlProperty?: string | null;
+	readTimeProperty?: string | null;
+	ratingProperty?: string | null;
+	includeEmpty?: boolean | null;
 }
 
 /** Query every page in the data source and group them by URL. */
@@ -191,7 +191,7 @@ async function findDuplicates(
 	let scanned = 0;
 
 	while (hasMore) {
-		const response = await notion.dataSources.query({
+		const response: any = await notion.dataSources.query({
 			data_source_id: options.dataSourceId,
 			...(startCursor ? { start_cursor: startCursor } : {}),
 		});
@@ -380,15 +380,16 @@ worker.tool("findDuplicateUrls", {
 	title: "Find Duplicate URLs",
 	description:
 		"Scan a Notion data source and report entries that share the same URL. Does not modify anything.",
+	hints: { readOnlyHint: true },
 	schema: j.object({
 		dataSourceId: j.string().describe("The ID of the Notion data source (database) to scan."),
 		urlProperty: j
 			.string()
-			.optional()
+			.nullable()
 			.describe("Name of the URL property (case-insensitive). Defaults to 'URL'."),
 		includeEmpty: j
 			.boolean()
-			.optional()
+			.nullable()
 			.describe("Treat entries with an empty URL as a group too. Defaults to false."),
 	}),
 	execute: async (input, { notion }: { notion: any }) => {
@@ -422,27 +423,27 @@ worker.tool("deduplicateUrls", {
 		dataSourceId: j.string().describe("The ID of the Notion data source (database) to deduplicate."),
 		urlProperty: j
 			.string()
-			.optional()
+			.nullable()
 			.describe("Name of the URL property (case-insensitive). Defaults to 'URL'."),
 		readTimeProperty: j
 			.string()
-			.optional()
+			.nullable()
 			.describe(
 				"Name of the read time (date) property to preserve when deduplicating. Defaults to 'Read time'.",
 			),
 		ratingProperty: j
 			.string()
-			.optional()
+			.nullable()
 			.describe(
 				"Name of the rating (select) property to preserve when deduplicating. Defaults to 'Rating'.",
 			),
 		includeEmpty: j
 			.boolean()
-			.optional()
+			.nullable()
 			.describe("Treat entries with an empty URL as a group too. Defaults to false."),
 		dryRun: j
 			.boolean()
-			.optional()
+			.nullable()
 			.describe("Preview the changes without modifying or archiving anything. Defaults to false."),
 	}),
 	execute: async (input, { notion }: { notion: any }) => {
@@ -462,7 +463,7 @@ worker.tool("deduplicateUrls", {
 			duplicateUrlCount: duplicates.size,
 			deletedCount,
 			dryRun,
-			details: report,
+			details: report as any,
 		};
 	},
 });
